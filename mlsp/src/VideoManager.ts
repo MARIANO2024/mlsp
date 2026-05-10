@@ -46,6 +46,12 @@
 
 export type CameraStatus = 'idle' | 'requesting' | 'active' | 'denied' | 'error';
 
+export interface VideoStreamInfo {
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+}
+
 export class VideoManager {
   // The live stream coming from the camera hardware.
   // null means the camera hasn't been opened yet (or was stopped).
@@ -66,6 +72,7 @@ export class VideoManager {
   // or rejects with a DOMException on denial / hardware error.
   // ---------------------------------------------------------------------------
   async initialize(): Promise<MediaStream> {
+    this.stop();
     this.stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'user',      // prefer front-facing camera
@@ -125,6 +132,16 @@ export class VideoManager {
   // ---------------------------------------------------------------------------
   getStream(): MediaStream | null {
     return this.stream;
+  }
+
+  getStreamInfo(): VideoStreamInfo {
+    const track = this.stream?.getVideoTracks()[0];
+    const settings = track?.getSettings();
+    return {
+      width: settings?.width ?? null,
+      height: settings?.height ?? null,
+      fps: settings?.frameRate ?? null,
+    };
   }
 }
 

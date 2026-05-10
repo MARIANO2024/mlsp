@@ -137,7 +137,7 @@ export class PostCaptureNmfOrchestrator {
 
       await report(
         'Audio NMF',
-        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} restarts, k=${POST_CAPTURE_NMF.AUDIO_K}; alpha mode — H random, each iter H[0,:] += α·h_init[0,:] (default α=${NMF_ALPHA_PRIOR_DEFAULT}).`,
+        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} restarts, k=${POST_CAPTURE_NMF.AUDIO_K}; alpha mode — α·h_init[0,:] on H[0,:] before row-sum scale, first half of iterations only (default α=${NMF_ALPHA_PRIOR_DEFAULT}).`,
       );
       const audioBest = MatrixManager.chooseBestNmmf(
         D,

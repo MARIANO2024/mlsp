@@ -13,7 +13,7 @@ import * as tf from '@tensorflow/tfjs';
 const EPS = 1e-9;
 
 /** Default prior weight when `nnmf` runs in `alpha` mode (can override via `alphaAtIter`). */
-export const NMF_ALPHA_PRIOR_DEFAULT = 0.1;
+export const NMF_ALPHA_PRIOR_DEFAULT = 0.12;
 
 export type VideoColorOrder = 'bgr' | 'rgb';
 
@@ -37,14 +37,15 @@ export interface ChooseBestNmmfOptions {
 /** Options for multiplicative NMF / KL (`nnmf`). */
 export interface NnmfOptions {
   /**
-   * When `true` and `h_init` is provided: `H` is fully random; each iteration adds
-   * `alphaAtIter(t) * h_init[0, :]` to `H[0, :]` after the multiplicative row-normalized update.
-   * When `false` or `h_init` is omitted: same as before (`H` is a clone of `h_init` or random).
+   * When `true` and `h_init` is provided: `H` is fully random; for the **first half** of iterations
+   * (`i * 2 < nIter`), add `alphaAtIter(i) * h_init[0, :]` to `H[0, :]` after the multiplicative **H**
+   * update but **before** the row-sum scale. After halfway, no prior (same as `alphaAtIter === 0`).
+   * When `false` or `h_init` is omitted: same as before (`H` clone or random).
    */
   alpha?: boolean;
   /**
-   * Prior strength at iteration `iter` (0-based) for `alpha` mode. Defaults to constant
-   * {@link NMF_ALPHA_PRIOR_DEFAULT} (e.g. decay: `(i) => 0.1 / (1 + i * 0.01)`).
+   * Prior strength at iteration `iter` (0-based) for `alpha` mode **while `iter * 2 < nIter`**
+   * (no bump in the second half). Defaults to {@link NMF_ALPHA_PRIOR_DEFAULT}.
    */
   alphaAtIter?: (iter: number) => number;
 }
@@ -109,8 +110,9 @@ export class MatrixManager {
    * Multiplicative NMF/KL updates (same update equations as notebook `nnmf`).
    * Borrowed tensors: caller owns `X` and `h_init` (never disposed here); returned `w`, `h` are new tensors.
    *
-   * **Alpha mode** (`options.alpha === true` and `h_init` set): `W` and `H` start random; after each
-   * iteration’s scaled multiplicative update, `H[0,:] += alphaAtIter(iter) * h_init[0,:]`.
+   * **Alpha mode** (`options.alpha === true` and `h_init` set): `W` and `H` start random; for the **first
+   * half** of iterations only (`i * 2 < nIter`), after each multiplicative **H** update,
+   * `H[0,:] += alphaAtIter(i) * h_init[0,:]`, then row-sum normalization of `H` and matching scale of `W`.
    */
   static nnmf(
     X: tf.Tensor2D,
@@ -152,7 +154,8 @@ export class MatrixManager {
     const posEps = tf.scalar(EPS);
 
     for (let i = 0; i < nIter; i++) {
-      const alphaCoeff = alphaAtIter(i);
+      const alphaCoeff =
+        useAlphaPrior && i * 2 < nIter ? alphaAtIter(i) : 0;
       const next = tf.tidy(() => {
         const Xhat0 = tf.matMul(w, h).add(posEps);
         const ratio0 = XFloat.div(Xhat0);
@@ -166,16 +169,16 @@ export class MatrixManager {
         const denH = tf.sum(wNew, 0).reshape([k, 1]).add(posEps);
         let hNew = h.mul(numH.div(denH));
 
-        const scale = tf.sum(hNew, 1).reshape([k, 1]).add(posEps);
-        hNew = hNew.div(scale);
-        wNew = wNew.mul(scale.transpose());
-
         if (useAlphaPrior && hInitRow0 != null && alphaCoeff !== 0) {
           const bump = hInitRow0.mul(tf.scalar(alphaCoeff));
           const row0 = hNew.slice([0, 0], [1, N]).add(bump);
           const tail = hNew.slice([1, 0], [k - 1, N]);
           hNew = tf.concat([row0, tail], 0) as tf.Tensor2D;
         }
+
+        const scale = tf.sum(hNew, 1).reshape([k, 1]).add(posEps);
+        hNew = hNew.div(scale);
+        wNew = wNew.mul(scale.transpose());
 
         return { wNew, hNew };
       });
@@ -237,16 +240,16 @@ export class MatrixManager {
       const bestRow = tf.slice(h, [bestIdx, 0], [1, h.shape[1]]).squeeze([0]).toFloat();
 
       // --- Notebook follow-up (gating + scale to [0,1] where range > 0) — commented out for now ---
-      // const rowMin = tf.min(bestRow);
-      // const rowMax = tf.max(bestRow);
-      // const rangeOk = rowMax.sub(rowMin).greater(0);
-      // const thresholdVal = rowMin.add(rowMax.sub(rowMin).mul(0.5));
-      // let gated = tf.where(bestRow.greaterEqual(thresholdVal), bestRow, tf.zerosLike(bestRow));
-      // const gMax = tf.max(gated);
-      // gated = tf.where(gMax.greater(0), gated.div(gMax), gated);
-      // return tf.where(rangeOk, gated, tf.zerosLike(bestRow)) as tf.Tensor1D;
+      const rowMin = tf.min(bestRow);
+      const rowMax = tf.max(bestRow);
+      const rangeOk = rowMax.sub(rowMin).greater(0);
+      const thresholdVal = rowMin.add(rowMax.sub(rowMin).mul(0.5));
+      let gated = tf.where(bestRow.greaterEqual(thresholdVal), bestRow, tf.zerosLike(bestRow));
+      const gMax = tf.max(gated);
+      gated = tf.where(gMax.greater(0), gated.div(gMax), gated);
+      return tf.where(rangeOk, gated, tf.zerosLike(bestRow)) as tf.Tensor1D;
 
-      return bestRow as tf.Tensor1D;
+      // return bestRow as tf.Tensor1D;
     });
   }
 

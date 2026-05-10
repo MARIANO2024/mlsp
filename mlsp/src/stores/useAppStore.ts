@@ -17,17 +17,16 @@
 //     re-renders only when the selected slice of state changes (no wasted
 //     renders from unrelated updates).
 //
-//   • State lives outside the React tree, so non-React code (like VideoManager
-//     or a future AudioEngine class) can read it too via
-//     `useAppStore.getState()`.
+//   • State lives outside the React tree, so non-React code (like AudioManager
+//     or VideoManager) can read it via `useAppStore.getState()` and write it
+//     via `useAppStore.setState(...)`.
 //
-// SHAPE OF THIS STORE:
+// STATE GROUPS IN THIS STORE:
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//   cameraStatus  ── what the camera hardware is currently doing
-//   audioFiles    ── list of available audio file names/paths
-//   selectedAudio ── whichever file the user picked
-//   phase         ── the overall session lifecycle (see AppPhase below)
+//   Camera    — what the hardware is currently doing
+//   Audio     — available files, which one is loaded, playback status
+//   UI        — only state that needs to be shared outside one component
 //
 // =============================================================================
 
@@ -35,24 +34,14 @@ import { create } from 'zustand';
 import type { CameraStatus } from '../VideoManager';
 
 // ---------------------------------------------------------------------------
-// AppPhase — the session lifecycle state machine
+// AudioLoadStatus — tracks the lifecycle of loading a file into the decoder
 //
-//   idle  ──(user picks audio)──► armed
-//   armed ──(user clicks Record)──► countdown
-//   countdown ──(timer expires)──► recording
-//   recording ──(audio ends)──► done
-//   done ──(user resets)──► idle
-//
-// Having a single `phase` field (rather than several booleans like
-// `isRecording`, `isCountingDown`) makes it impossible to be in two
-// contradictory states at once and is easy to render conditionally.
+//   idle      → no file has been requested yet
+//   loading   → fetch + decodeAudioData in progress
+//   ready     → AudioBuffer is decoded and in memory
+//   error     → fetch or decode failed
 // ---------------------------------------------------------------------------
-export type AppPhase =
-  | 'idle'        // nothing happening — initial state
-  | 'armed'       // audio selected, ready to trigger
-  | 'countdown'   // brief pause before playback + capture begin
-  | 'recording'   // audio playing AND camera being recorded simultaneously
-  | 'done';       // session finished; data ready to download / process
+export type AudioLoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 interface AppStore {
   // --- Camera ---
@@ -60,28 +49,30 @@ interface AppStore {
   setCameraStatus: (s: CameraStatus) => void;
 
   // --- Audio ---
-  audioFiles: string[];          // populated from the public/ folder listing
-  selectedAudio: string | null;  // file path chosen by the user
-  setAudioFiles: (files: string[]) => void;
-  setSelectedAudio: (file: string | null) => void;
-
-  // --- Session phase ---
-  phase: AppPhase;
-  setPhase: (p: AppPhase) => void;
+  // selectedAudio: filename chosen by the user (display + reset logic)
+  // audioLoadStatus: lifecycle of fetch + decodeAudioData for the chosen file
+  // isPlaying: true while the AudioBufferSourceNode is running
+  //
+  // Note: the *list* of available files is NOT stored here — it comes from
+  // import.meta.glob in musicFiles.ts and is statically known at build time.
+  selectedAudio: string | null;
+  audioLoadStatus: AudioLoadStatus;
+  isPlaying: boolean;
+  setSelectedAudio:   (file: string | null) => void;
+  setAudioLoadStatus: (s: AudioLoadStatus) => void;
+  setIsPlaying:       (v: boolean) => void;
 }
 
 export const useAppStore = create<AppStore>((set) => ({
-  // Camera — starts idle; VideoManager.initialize() will push it to 'active'
+  // Camera — starts idle; VideoManager.initialize() drives it to 'active'
   cameraStatus: 'idle',
   setCameraStatus: (cameraStatus) => set({ cameraStatus }),
 
-  // Audio — files will be loaded (e.g. from /public) before the user interacts
-  audioFiles: [],
-  selectedAudio: null,
-  setAudioFiles:    (audioFiles)    => set({ audioFiles }),
-  setSelectedAudio: (selectedAudio) => set({ selectedAudio }),
-
-  // Session — begins at idle; driven by user actions in App.tsx
-  phase: 'idle',
-  setPhase: (phase) => set({ phase }),
+  // Audio — file list comes from musicFiles.ts; store only tracks runtime state
+  selectedAudio:   null,
+  audioLoadStatus: 'idle',
+  isPlaying:       false,
+  setSelectedAudio:   (selectedAudio)   => set({ selectedAudio }),
+  setAudioLoadStatus: (audioLoadStatus) => set({ audioLoadStatus }),
+  setIsPlaying:       (isPlaying)       => set({ isPlaying }),
 }));
