@@ -31,6 +31,7 @@ import { useAppStore } from './stores/useAppStore';
 import { musicFiles } from './musicFiles';
 import { PostCaptureNmfOrchestrator, POST_CAPTURE_NMF, type AudioNmfFactorization } from './nmf/PostCaptureNmfOrchestrator';
 import { AudioNmfFactorizationPlots } from './nmf/NmfPlots';
+import { encodeWavMono16 } from './nmf/wavEncode';
 
 // Single source of truth for the column width — change here to resize everything.
 const W = '78%';
@@ -99,6 +100,31 @@ function downloadBlob(blob: Blob, filename: string) {
 function makeMatrixFilename(videoFilename: string) {
   return videoFilename.replace(/\.webm$/i, '_matrix.json');
 }
+
+function makeResidualWavFilename(videoFilename: string) {
+  return videoFilename.replace(/\.webm$/i, '_nmf_residual_no_comp0.wav');
+}
+
+function makeRemixWavFilename(videoFilename: string) {
+  return videoFilename.replace(/\.webm$/i, '_nmf_remix_round2.wav');
+}
+
+function cloneAudioFactorization(a: AudioNmfFactorization): AudioNmfFactorization {
+  return {
+    freqBins: a.freqBins,
+    timeFrames: a.timeFrames,
+    wColumns: a.wColumns.map(col => [...col]),
+    hRows: a.hRows.map(row => [...row]),
+    hInitUpscaledRow: [...a.hInitUpscaledRow],
+    reconstructionError: a.reconstructionError,
+  };
+}
+
+type Round1Bundle = {
+  audio: AudioNmfFactorization;
+  residualMono: Float32Array;
+  sampleRate: number;
+};
 
 function formatMs(ms: number) {
   return `${ms.toFixed(2)} ms`;
@@ -265,6 +291,8 @@ function App() {
   const [previewFrames, setPreviewFrames] = useState<PreviewFrame[]>([]);
   const [audioNmf, setAudioNmf] = useState<AudioNmfFactorization | null>(null);
   const [isCalculating, setIsCalculating] = useState(false);
+  /** 1 = next/full pipeline (original audio); 2 = remix round (residual audio) until round 2 finishes. */
+  const [captureRoundUi, setCaptureRoundUi] = useState<1 | 2>(1);
   /** Loading-overlay copy while post-capture pipeline runs (step-specific). */
   const [capturePipelinePhase, setCapturePipelinePhase] = useState<{
     headline: string;
@@ -279,6 +307,7 @@ function App() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingTimersRef = useRef<number[]>([]);
   const discardRecordingRef = useRef(false);
+  const round1BundleRef = useRef<Round1Bundle | null>(null);
   const audioWindowRef = useRef<PlaybackWindow | null>(null);
   const videoStartWallRef = useRef<number | null>(null);
   const videoEndWallRef = useRef<number | null>(null);
@@ -336,6 +365,46 @@ function App() {
       `start delta: ${formatDelta(videoStart, audioWindow?.startWallMs ?? null)}`,
       `end delta:   ${formatDelta(videoEnd, audioWindow?.endWallMs ?? null)}`,
     ]);
+  }
+
+  /** After round 2: clear matrix previews, NMF plots, and bundle so the next capture is round 1 again. */
+  function resetToCapture1Baseline() {
+    round1BundleRef.current = null;
+    setPreviewFrames([]);
+    setMatrixShape(null);
+    setAudioNmf(null);
+    setLastRecordingName(null);
+    setCaptureRoundUi(1);
+    if (audioManager.isLoaded()) {
+      try {
+        audioManager.restoreAnalysisPlayback();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function preparePlaybackBufferForCapture() {
+    if (round1BundleRef.current) {
+      const b = round1BundleRef.current;
+      audioManager.replacePlaybackWithMono(b.residualMono, b.sampleRate);
+      return;
+    }
+    if (audioManager.isLoaded()) {
+      audioManager.restoreAnalysisPlayback();
+    }
+  }
+
+  function handleResetNmfPlots() {
+    if (isCalculating) return;
+    if (isPlaying) {
+      audioManager.stop();
+      setIsPlaying(false);
+      setTimeline(EMPTY_TIMELINE);
+    }
+    cancelScheduledRecording(false);
+    resetToCapture1Baseline();
+    setSyncConsoleLines(['NMF plots and remix state cleared. Your audio file is still loaded.']);
   }
 
   function cancelScheduledRecording(updateStatus = true) {
@@ -438,17 +507,50 @@ function App() {
         if (!mono) {
           throw new Error('No decoded audio in memory. Select and load a track before capture.');
         }
-        const { audio } = await PostCaptureNmfOrchestrator.run(
-          videoMatrix.matrix,
-          mono,
-          (headline, body) => setCapturePipelinePhase({ headline, body }),
-        );
-        setAudioNmf(audio);
+        const sampleRate = audioManager.getBufferInfo()?.sampleRate ?? 48_000;
+
+        const headlineRound2 = (headline: string, body: string) =>
+          setCapturePipelinePhase({
+            headline: headline.includes('Round 2') ? headline : `Round 2 · ${headline}`,
+            body,
+          });
+
+        if (!round1BundleRef.current) {
+          const { audio, residualNoComp0Mono, sampleRate: rateOut } = await PostCaptureNmfOrchestrator.run(
+            videoMatrix.matrix,
+            mono,
+            sampleRate,
+            (headline, body) => setCapturePipelinePhase({ headline, body }),
+          );
+          setAudioNmf(audio);
+          round1BundleRef.current = {
+            audio: cloneAudioFactorization(audio),
+            residualMono: Float32Array.from(residualNoComp0Mono),
+            sampleRate: rateOut,
+          };
+          setCaptureRoundUi(2);
+          const residualBuf = encodeWavMono16(residualNoComp0Mono, rateOut);
+          downloadBlob(new Blob([residualBuf], { type: 'audio/wav' }), makeResidualWavFilename(filename));
+        } else {
+          const { remixedMono, sampleRate: rateOut } = await PostCaptureNmfOrchestrator.runRound2Remix(
+            videoMatrix.matrix,
+            mono,
+            sampleRate,
+            round1BundleRef.current.audio,
+            headlineRound2,
+          );
+          const remixBuf = encodeWavMono16(remixedMono, rateOut);
+          downloadBlob(new Blob([remixBuf], { type: 'audio/wav' }), makeRemixWavFilename(filename));
+          resetToCapture1Baseline();
+          setLastRecordingName(matrixFilename);
+        }
 
         setRecordingStatus('saved');
       } catch (err) {
         setRecordingStatus('error');
-        setAudioNmf(null);
+        if (!round1BundleRef.current) {
+          setAudioNmf(null);
+        }
         setSyncConsoleLines([
           `Post-capture pipeline failed: ${err instanceof Error ? err.message : 'unknown error'}.`,
         ]);
@@ -460,9 +562,6 @@ function App() {
 
     recorderRef.current = recorder;
     setLastRecordingName(null);
-    setMatrixShape(null);
-    setPreviewFrames([]);
-    setAudioNmf(null);
     setRecordingStatus('waiting');
 
     const startDelayMs = Math.max(windowInfo.startWallMs - performance.now(), 0);
@@ -533,6 +632,8 @@ function App() {
     }
 
     audioManager.reset();
+    round1BundleRef.current = null;
+    setCaptureRoundUi(1);
     setSelectedAudio(filename);
     setAudioLoadStatus('loading');
     setMatrixShape(null);
@@ -575,6 +676,7 @@ function App() {
       return;
     }
     try {
+      preparePlaybackBufferForCapture();
       await audioManager.playSequence(TOTAL_PLAYS, GAP_SECONDS, () => {
         setIsPlaying(false);
         setTimeline(EMPTY_TIMELINE);
@@ -605,7 +707,7 @@ function App() {
   const playLabel =
     isPlaying                       ? 'Stop'
     : audioLoadStatus === 'loading' ? '…'
-    : 'Play + Capture Play 2';
+    : `Play + Capture ${captureRoundUi}`;
 
   const playDisabled = (audioLoadStatus !== 'ready' && !isPlaying) || isCalculating;
 
@@ -620,14 +722,19 @@ function App() {
     ? `${timeline.elapsedSeconds.toFixed(2)}s / ${timeline.totalSeconds.toFixed(2)}s`
     : 'Select an audio file to run the sync proof';
 
-  const recordingLabel: Record<RecordingStatus, string> = {
-    idle: 'Second-play video capture is armed when playback starts.',
-    waiting: 'Video capture waiting for play 2.',
-    recording: 'Recording play 2 video now.',
-    saving: 'Saving captured video.',
-    saved: lastRecordingName ? `Saved ${lastRecordingName}` : 'Saved play 2 video.',
-    error: 'Video capture failed.',
-  };
+  const recordingLabel = (() => {
+    const c = captureRoundUi;
+    return {
+      idle: c === 1
+        ? 'Capture 1: start playback to record video on the second play.'
+        : 'Capture 2: start playback (residual track) to record on the second play.',
+      waiting: `Capture ${c}: waiting for second play to start recording.`,
+      recording: `Capture ${c}: recording video now.`,
+      saving: `Capture ${c}: saving video and running pipeline…`,
+      saved: lastRecordingName ? `Saved ${lastRecordingName}` : `Capture ${c} finished.`,
+      error: 'Video capture or pipeline failed.',
+    } satisfies Record<RecordingStatus, string>;
+  })();
 
   const showOverlay = cameraStatus !== 'active';
   const overlayMessage: Record<string, string> = {
@@ -650,15 +757,24 @@ function App() {
       backgroundColor: '#0f0f13',
     }}>
 
-      {/* ── Video container ──────────────────────────────────────────────── */}
+      {/* ── Live camera + NMF reset ───────────────────────────────────────── */}
       <div style={{
-        position: 'relative',
         width: W,
-        height: '58vh',
-        backgroundColor: '#1a0000',
-        borderRadius: '12px',
-        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'row',
+        gap: '12px',
+        alignItems: 'stretch',
       }}>
+        <div style={{
+          position: 'relative',
+          flex: 1,
+          minWidth: 0,
+          height: '58vh',
+          backgroundColor: '#1a0000',
+          borderRadius: '12px',
+          overflow: 'hidden',
+        }}>
+
         <video
           ref={videoRef}
           autoPlay
@@ -694,6 +810,33 @@ function App() {
             <span>{overlayMessage[cameraStatus]}</span>
           </div>
         )}
+        </div>
+
+        <button
+          type="button"
+          onClick={handleResetNmfPlots}
+          disabled={controlsLocked}
+          title="Clear NMF plots and remix state; keep loaded audio file"
+          style={{
+            flex: '0 0 auto',
+            alignSelf: 'stretch',
+            width: 'clamp(72px, 12vw, 100px)',
+            padding: '10px 8px',
+            borderRadius: '12px',
+            border: '1px solid #3a3a55',
+            background: 'linear-gradient(180deg, #252542 0%, #1a1a2e 100%)',
+            color: '#b7b7d8',
+            fontSize: '13px',
+            fontWeight: 700,
+            letterSpacing: '0.04em',
+            cursor: controlsLocked ? 'not-allowed' : 'pointer',
+            opacity: controlsLocked ? 0.45 : 1,
+          }}
+        >
+          Reset
+          <br />
+          <span style={{ fontWeight: 500, fontSize: '11px', color: '#777' }}>plots</span>
+        </button>
       </div>
 
       {/* ── Audio playback bar — fills while sound is playing ───────────── */}

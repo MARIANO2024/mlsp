@@ -26,6 +26,23 @@ export interface ProcessAudioOptions {
   center?: boolean;
 }
 
+/** Metadata for ISTFT matching {@link MatrixManager.stftMagnitudeAndComplex} / `processAudioMono`. */
+export interface StftIstftMeta {
+  nFft: number;
+  hopLength: number;
+  center: boolean;
+  originalLength: number;
+  paddedLength: number;
+}
+
+export interface StftMagnitudeAndPhase {
+  /** Magnitude |STFT|, shape `[n_fft // 2 + 1, numFrames]` (same as `processAudioMono`). */
+  D: tf.Tensor2D;
+  /** Complex STFT from `tf.signal.stft`, shape `[numFrames, n_fft // 2 + 1]` (phase for resynthesis). */
+  stftComplex: tf.Tensor;
+  meta: StftIstftMeta;
+}
+
 export interface ChooseBestNmmfOptions {
   nRestarts?: number;
   nIter?: number;
@@ -261,6 +278,17 @@ export class MatrixManager {
     x: tf.Tensor1D | Float32Array | number[],
     options: ProcessAudioOptions = {},
   ): tf.Tensor2D {
+    const { D } = MatrixManager.stftMagnitudeAndComplex(x, options);
+    return D;
+  }
+
+  /**
+   * Same framing as `processAudioMono`, but also returns complex STFT for phase–locked magnitude resynthesis.
+   */
+  static stftMagnitudeAndComplex(
+    x: tf.Tensor1D | Float32Array | number[],
+    options: ProcessAudioOptions = {},
+  ): StftMagnitudeAndPhase {
     const nFft = options.nFft ?? 512;
     const hopLength = options.hopLength ?? 256;
     const center = options.center ?? true;
@@ -268,16 +296,122 @@ export class MatrixManager {
     return tf.tidy(() => {
       const signal: tf.Tensor1D =
         x instanceof tf.Tensor ? (x as tf.Tensor1D).toFloat() : tf.tensor1d(x);
-      let y = signal;
+      const originalLength = signal.size;
+      let y: tf.Tensor1D = signal;
+      let paddedLength = originalLength;
       if (center) {
         const pad = Math.floor(nFft / 2);
         y = tf.pad(signal, [[pad, pad]], 0);
+        paddedLength = y.size;
       }
 
       const stftC = tf.signal.stft(y, nFft, hopLength, nFft, tf.signal.hannWindow);
       const mag = tf.abs(stftC) as tf.Tensor2D;
-      return mag.transpose([1, 0]) as tf.Tensor2D;
+      const D = mag.transpose([1, 0]) as tf.Tensor2D;
+
+      return {
+        D,
+        stftComplex: stftC as tf.Tensor,
+        meta: { nFft, hopLength, center, originalLength, paddedLength },
+      };
     });
+  }
+
+  /**
+   * Rebuild a real waveform: use `magnitudeFreqTime` as |STFT| but keep phase from the reference STFT.
+   * `magnitudeFreqTime` and `stftComplex` must match shapes `[F, T]` and `[T, F]` from the same forward setup.
+   */
+  static istftMagnitudeWithOriginalPhase(
+    magnitudeFreqTime: tf.Tensor2D,
+    stftComplex: tf.Tensor,
+    meta: StftIstftMeta,
+  ): Float32Array {
+    const { nFft, hopLength, center, originalLength, paddedLength } = meta;
+    const [F, numFrames] = magnitudeFreqTime.shape;
+    const [Tdim, Fdim] = stftComplex.shape;
+    if (Tdim !== numFrames || Fdim !== F) {
+      throw new Error(
+        `ISTFT shape mismatch: |D| [${F}, ${numFrames}] vs STFT [${Tdim}, ${Fdim}]`,
+      );
+    }
+
+    const weightedFrames = tf.tidy(() => {
+      const win = tf.signal.hannWindow(nFft).reshape([1, nFft]);
+      const magT = tf.relu(tf.transpose(magnitudeFreqTime, [1, 0]));
+      const phase = tf.atan2(tf.imag(stftComplex), tf.real(stftComplex));
+      const spec = tf.complex(magT.mul(tf.cos(phase)), magT.mul(tf.sin(phase)));
+      const frames = tf.irfft(spec) as tf.Tensor2D;
+      return tf.mul(frames, win) as tf.Tensor2D;
+    });
+
+    const frameData = weightedFrames.dataSync();
+    weightedFrames.dispose();
+
+    const out = new Float32Array(paddedLength);
+    const denom = new Float32Array(paddedLength);
+    const win = tf.signal.hannWindow(nFft).dataSync() as Float32Array;
+    const win2 = new Float32Array(nFft);
+    for (let i = 0; i < nFft; i++) win2[i] = win[i]! * win[i]!;
+
+    for (let t = 0; t < numFrames; t++) {
+      const start = t * hopLength;
+      const base = t * nFft;
+      for (let i = 0; i < nFft && start + i < paddedLength; i++) {
+        const j = start + i!;
+        out[j] += frameData[base + i]!;
+        denom[j] += win2[i]!;
+      }
+    }
+
+    const eps = 1e-8;
+    for (let i = 0; i < paddedLength; i++) {
+      const d = denom[i]!;
+      if (d > eps) out[i]! /= d;
+    }
+
+    if (!center) {
+      return out.length === originalLength ? out : out.slice(0, originalLength);
+    }
+    const pad = Math.floor(nFft / 2);
+    return out.slice(pad, pad + originalLength);
+  }
+
+  /**
+   * Resynthesize time-domain audio whose STFT magnitude is `W[:, nDrop:] @ H[nDrop:, :]` (KL NMF factors),
+   * using the phase of the original mono STFT. Caller disposes `w` / `h` if appropriate.
+   */
+  static synthesizeMonoExcludingLeadingHRows(
+    mono: Float32Array,
+    w: tf.Tensor2D,
+    h: tf.Tensor2D,
+    nDrop: number,
+    options: ProcessAudioOptions = {},
+  ): Float32Array {
+    const [Fw, k] = w.shape;
+    const [kh, T] = h.shape;
+    if (kh !== k) {
+      throw new Error(`synthesizeMonoExcludingLeadingHRows: W columns ${k} vs H rows ${kh}`);
+    }
+    if (nDrop <= 0) {
+      return Float32Array.from(mono);
+    }
+    if (nDrop >= k) {
+      throw new Error(`synthesizeMonoExcludingLeadingHRows: nDrop ${nDrop} >= k ${k}`);
+    }
+
+    const { D: _d, stftComplex, meta } = MatrixManager.stftMagnitudeAndComplex(mono, options);
+    _d.dispose();
+
+    const magHat = tf.tidy(() => {
+      const wKeep = tf.slice(w, [0, nDrop], [Fw, k - nDrop]);
+      const hKeep = tf.slice(h, [nDrop, 0], [k - nDrop, T]);
+      return tf.matMul(wKeep, hKeep) as tf.Tensor2D;
+    });
+
+    const wav = MatrixManager.istftMagnitudeWithOriginalPhase(magHat, stftComplex, meta);
+    magHat.dispose();
+    stftComplex.dispose();
+    return wav;
   }
 
   /** Matches notebook `upscale_activation` (1-D linear interpolation). */

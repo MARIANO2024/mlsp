@@ -31,6 +31,16 @@ export interface AudioNmfFactorization {
 
 export interface PostCaptureNmfResult {
   audio: AudioNmfFactorization;
+  /** Time-domain resynthesis with STFT magnitude ≈ W[:,1:] @ H[1:,:] and original phase (biased comp 0 removed). */
+  residualNoComp0Mono: Float32Array;
+  sampleRate: number;
+}
+
+export interface PostCaptureRemixResult {
+  /** Same W as round 1; H row 0 from second video; rows 1–2 from round 1. */
+  audio: AudioNmfFactorization;
+  remixedMono: Float32Array;
+  sampleRate: number;
 }
 
 /** Report pipeline phase to UI (e.g. loading overlay). */
@@ -64,6 +74,33 @@ function extractHRows(h: tf.Tensor2D): number[][] {
   return rows;
 }
 
+function tensorWFromColumns(wColumns: number[][]): tf.Tensor2D {
+  const k = wColumns.length;
+  if (k === 0) throw new Error('tensorWFromColumns: empty W');
+  const f = wColumns[0]!.length;
+  const data = new Float32Array(f * k);
+  for (let i = 0; i < f; i++) {
+    for (let j = 0; j < k; j++) {
+      data[i * k + j] = wColumns[j]![i]!;
+    }
+  }
+  return tf.tensor2d(data, [f, k]);
+}
+
+function tensorHFromRows(rows: number[][]): tf.Tensor2D {
+  const k = rows.length;
+  if (k === 0) throw new Error('tensorHFromRows: empty H');
+  const n = rows[0]!.length;
+  const data = new Float32Array(k * n);
+  for (let r = 0; r < k; r++) {
+    if (rows[r]!.length !== n) {
+      throw new Error(`tensorHFromRows: row length mismatch (${rows[r]!.length} vs ${n})`);
+    }
+    data.set(rows[r]!, r * n);
+  }
+  return tf.tensor2d(data, [k, n]);
+}
+
 export class PostCaptureNmfOrchestrator {
   /**
    * Both video and audio factorizations use `chooseBestNmmf` (multiple random restarts, lowest KL).
@@ -74,6 +111,7 @@ export class PostCaptureNmfOrchestrator {
   static async run(
     videoMatrix: number[][],
     audioMono: Float32Array,
+    sampleRate: number,
     onStep?: CaptureNmfStepReporter,
   ): Promise<PostCaptureNmfResult> {
     const report = async (headline: string, body: string) => {
@@ -153,6 +191,17 @@ export class PostCaptureNmfOrchestrator {
       D.dispose();
       D = null;
 
+      await report(
+        'Residual audio (no comp 0)',
+        'ISTFT: magnitude WH with row/column 0 removed, phase from original STFT → WAV export.',
+      );
+      const residualNoComp0Mono = MatrixManager.synthesizeMonoExcludingLeadingHRows(
+        audioMono,
+        audioBest.w,
+        audioBest.h,
+        1,
+      );
+
       const wColumns = extractWColumns(audioBest.w);
       const hRows = extractHRows(audioBest.h);
       const err = audioBest.error;
@@ -171,11 +220,142 @@ export class PostCaptureNmfOrchestrator {
           hInitUpscaledRow: upData,
           reconstructionError: err,
         },
+        residualNoComp0Mono,
+        sampleRate,
       };
     } catch (e) {
       xTensor?.dispose();
       D?.dispose();
       hInit?.dispose();
+      throw e;
+    }
+  }
+
+  /**
+   * Second capture: video NMF on new WebM → upscale activation; **W** and **H[1,:], H[2,:]** from
+   * round-one `audio`; **H[0,:]** from the new video. ISTFT(|W H|, original-mono phase).
+   */
+  static async runRound2Remix(
+    videoMatrix: number[][],
+    audioMono: Float32Array,
+    sampleRate: number,
+    round1Audio: AudioNmfFactorization,
+    onStep?: CaptureNmfStepReporter,
+  ): Promise<PostCaptureRemixResult> {
+    const report = async (headline: string, body: string) => {
+      await onStep?.(headline, body);
+      await yieldToBrowser();
+    };
+
+    const bestOpts: ChooseBestNmmfOptions = {
+      nIter: POST_CAPTURE_NMF.N_ITER,
+      nRestarts: POST_CAPTURE_NMF.N_RESTARTS,
+    };
+
+    let xTensor: tf.Tensor2D | null = tf.tensor2d(videoMatrix);
+    let D: tf.Tensor2D | null = null;
+    let wTensor: tf.Tensor2D | null = null;
+    let hTensor: tf.Tensor2D | null = null;
+    let magHat: tf.Tensor2D | null = null;
+    let stftComplex: tf.Tensor | null = null;
+
+    try {
+      await report(
+        'Round 2 · Video NMF',
+        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} restarts, k=${POST_CAPTURE_NMF.VIDEO_K} on new capture.`,
+      );
+      const vid = MatrixManager.chooseBestNmmf(
+        xTensor,
+        POST_CAPTURE_NMF.VIDEO_K,
+        undefined,
+        bestOpts,
+      );
+      xTensor.dispose();
+      xTensor = null;
+
+      await report(
+        'Round 2 · Video activation',
+        'process_activation: dominant H_video row → upscale to spectrogram time (new H row 0).',
+      );
+      const processedVideoActivation = MatrixManager.processActivation(vid.h);
+      vid.w.dispose();
+      vid.h.dispose();
+
+      await report('Round 2 · STFT', 'Same |D| framing as round 1 (centered STFT on original mix).');
+      const bundle = MatrixManager.stftMagnitudeAndComplex(audioMono);
+      D = bundle.D;
+      stftComplex = bundle.stftComplex;
+      const meta = bundle.meta;
+
+      const nFrames = D.shape[1]!;
+      const fBins = D.shape[0]!;
+
+      if (round1Audio.timeFrames !== nFrames || round1Audio.freqBins !== fBins) {
+        throw new Error(
+          `Round 2 remix: round-1 factors (${round1Audio.freqBins}×${round1Audio.timeFrames}) ` +
+            `do not match current STFT (${fBins}×${nFrames}). Load the same track or run round 1 again.`,
+        );
+      }
+
+      if (round1Audio.hRows.length < 3) {
+        throw new Error('Round 2 remix: round-1 H must have 3 rows.');
+      }
+
+      const upRow = MatrixManager.upscaleActivation(processedVideoActivation, D);
+      processedVideoActivation.dispose();
+
+      const upData = Array.from(upRow.dataSync());
+      upRow.dispose();
+
+      const h1 = round1Audio.hRows[1]!;
+      const h2 = round1Audio.hRows[2]!;
+      if (h1.length !== nFrames || h2.length !== nFrames) {
+        throw new Error('Round 2 remix: stored H rows 1–2 length mismatch.');
+      }
+
+      await report(
+        'Round 2 · Remixing audio',
+        'W from round 1; H[0] = new video stem; H[1],H[2] unchanged; ISTFT with original phase → play + WAV.',
+      );
+
+      wTensor = tensorWFromColumns(round1Audio.wColumns);
+      hTensor = tensorHFromRows([upData, h1, h2]);
+
+      const errTensor = MatrixManager.reconstructionError(D, wTensor, hTensor);
+      const reconstructionError = errTensor.dataSync()[0]!;
+      errTensor.dispose();
+
+      magHat = tf.matMul(wTensor, hTensor) as tf.Tensor2D;
+      const remixedMono = MatrixManager.istftMagnitudeWithOriginalPhase(magHat, stftComplex, meta);
+
+      wTensor.dispose();
+      wTensor = null;
+      hTensor.dispose();
+      hTensor = null;
+      magHat.dispose();
+      magHat = null;
+      D.dispose();
+      D = null;
+      stftComplex.dispose();
+      stftComplex = null;
+
+      const audio: AudioNmfFactorization = {
+        freqBins: fBins,
+        timeFrames: nFrames,
+        wColumns: round1Audio.wColumns,
+        hRows: [upData, Array.from(h1), Array.from(h2)],
+        hInitUpscaledRow: upData,
+        reconstructionError,
+      };
+
+      return { audio, remixedMono, sampleRate };
+    } catch (e) {
+      xTensor?.dispose();
+      D?.dispose();
+      wTensor?.dispose();
+      hTensor?.dispose();
+      magHat?.dispose();
+      stftComplex?.dispose();
       throw e;
     }
   }

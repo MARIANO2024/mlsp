@@ -90,6 +90,13 @@ export class AudioManager {
   // Decoded PCM data — reused across all source nodes and repetitions.
   private buffer: AudioBuffer | null = null;
 
+  /**
+   * Mono mix of the file last passed to `load()` — always the **original** track for STFT / phase.
+   * `replacePlaybackWithMono` swaps `buffer` only (playback); analysis stays here.
+   */
+  private analysisMono: Float32Array | null = null;
+  private analysisSampleRate: number | null = null;
+
   // All pre-scheduled source nodes for the current sequence.
   // Kept so stop() can cancel every node, not just the first.
   private sources: AudioBufferSourceNode[] = [];
@@ -131,7 +138,42 @@ export class AudioManager {
     if (!response.ok) throw new Error(`Failed to fetch audio: ${url}`);
     const arrayBuffer = await response.arrayBuffer();
     this.buffer = await ctx.decodeAudioData(arrayBuffer);
+    this.analysisSampleRate = this.buffer.sampleRate;
+    this.analysisMono = AudioManager.monoMixFromAudioBuffer(this.buffer);
     this._isPlaying = false;
+  }
+
+  private static monoMixFromAudioBuffer(audioBuffer: AudioBuffer): Float32Array {
+    const n = audioBuffer.length;
+    const ch = audioBuffer.numberOfChannels;
+    if (ch === 1) return Float32Array.from(audioBuffer.getChannelData(0));
+    const out = new Float32Array(n);
+    for (let c = 0; c < ch; c++) {
+      const data = audioBuffer.getChannelData(c);
+      for (let i = 0; i < n; i++) out[i] += data[i]! / ch;
+    }
+    return out;
+  }
+
+  /**
+   * Point `playSequence` at a different mono waveform (e.g. residual or remix) while keeping
+   * `getMonoSamples()` on the original mix for STFT phase / NMF.
+   */
+  replacePlaybackWithMono(samples: Float32Array, sampleRate: number): void {
+    this.stop();
+    const ctx = this.getContext();
+    const buf = ctx.createBuffer(1, samples.length, sampleRate);
+    buf.copyToChannel(Float32Array.from(samples), 0);
+    this.buffer = buf;
+    this._isPlaying = false;
+  }
+
+  /** Restore playback buffer from the last `load()` (original decoded file). */
+  restoreAnalysisPlayback(): void {
+    if (!this.analysisMono || this.analysisSampleRate == null) {
+      throw new Error('AudioManager: no analysis buffer — call load() first.');
+    }
+    this.replacePlaybackWithMono(this.analysisMono, this.analysisSampleRate);
   }
 
   // ---------------------------------------------------------------------------
@@ -243,6 +285,8 @@ export class AudioManager {
   reset(): void {
     this.stop();
     this.buffer = null;
+    this.analysisMono = null;
+    this.analysisSampleRate = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -395,18 +439,11 @@ export class AudioManager {
   isLoaded():  boolean { return this.buffer !== null; }
   getDuration(): number | null { return this.buffer?.duration ?? null; }
 
-  /** Mono mix (or single channel) as a **copy** suited for offline STFT/NMF. */
+  /** Mono mix of the **original** loaded file — unchanged when playback buffer is residual/remix. */
   getMonoSamples(): Float32Array | null {
+    if (this.analysisMono) return Float32Array.from(this.analysisMono);
     if (!this.buffer) return null;
-    const n = this.buffer.length;
-    const ch = this.buffer.numberOfChannels;
-    if (ch === 1) return Float32Array.from(this.buffer.getChannelData(0));
-    const out = new Float32Array(n);
-    for (let c = 0; c < ch; c++) {
-      const data = this.buffer.getChannelData(c);
-      for (let i = 0; i < n; i++) out[i] += data[i]! / ch;
-    }
-    return out;
+    return AudioManager.monoMixFromAudioBuffer(this.buffer);
   }
 }
 
