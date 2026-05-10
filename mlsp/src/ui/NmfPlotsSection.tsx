@@ -14,8 +14,8 @@ export function NmfPlotsSection({ width, audio }: NmfPlotsSectionProps) {
         marginTop: '14px',
         padding: '14px 16px',
         boxSizing: 'border-box',
-        backgroundColor: '#11111b',
-        border: '1px solid #252542',
+        backgroundColor: '#ffffff',
+        border: '1px solid #d8d8e0',
         borderRadius: '8px',
         overflowX: 'hidden',
       }}
