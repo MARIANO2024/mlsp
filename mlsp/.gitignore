@@ -12,10 +12,6 @@ dist
 dist-ssr
 *.local
 
-# Local audio — not tracked; drop .wav/.mp3 into public/music/ yourself
-public/music/*
-!public/music/.gitkeep
-!public/music/README.txt
 
 # Editor directories and files
 .vscode/*
