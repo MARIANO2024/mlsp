@@ -1,14 +1,5 @@
-/**
- * Post–video-capture analysis: best video NMF (k=2) → dominant activation (process_activation)
- * → upscale to spectrogram time → h_init with that row on top and random lower rows → STFT |D|
- * → best audio NMF (k=3) with h_init. Returns plain arrays for UI; owns all tensor dispose paths.
- */
-
 import * as tf from '@tensorflow/tfjs';
-import MatrixManager, {
-  NMF_ALPHA_PRIOR_DEFAULT,
-  type ChooseBestNmmfOptions,
-} from '../MatrixManager';
+import MatrixManager, { type ChooseBestNmmfOptions } from '../MatrixManager';
 
 export const POST_CAPTURE_NMF = {
   VIDEO_K: 2,
@@ -17,33 +8,52 @@ export const POST_CAPTURE_NMF = {
   N_RESTARTS: 10,
 } as const;
 
+export interface ComponentSimilarityScore {
+  componentIndex: number;
+  cosine: number;
+  onsetCosine: number;
+  pearson: number;
+  score: number;
+  shiftedScore: number;
+}
+
 export interface AudioNmfFactorization {
   freqBins: number;
   timeFrames: number;
-  /** Each column of W (length = freqBins), spectrogram-frequency template. */
   wColumns: number[][];
-  /** Each row of H (length = timeFrames), activation over STFT time. */
   hRows: number[][];
-  /** Upscaled video-derived row used only as h_init row 0 (for overlay plot, not the fitted H). */
-  hInitUpscaledRow: number[];
+  visualPrior: number[];
+  visualActivationFrames: number[];
+  selectedComponentIndex: number;
+  componentScores: ComponentSimilarityScore[];
+  shiftedPriorBestScore: number;
+  nullComparisonLabel: string;
   reconstructionError: number;
+  originalPeak: number;
+  selectedComponentPeak: number;
+  residualPeak: number;
+  round2TargetPeak?: number;
+  round2RemixPeak?: number;
+  round2Mode?: 'fixed-w' | 'grain-demo';
 }
 
 export interface PostCaptureNmfResult {
   audio: AudioNmfFactorization;
-  /** Time-domain resynthesis with STFT magnitude ≈ W[:,1:] @ H[1:,:] and original phase (biased comp 0 removed). */
-  residualNoComp0Mono: Float32Array;
+  selectedComponentMono: Float32Array;
+  residualMono: Float32Array;
   sampleRate: number;
+  debug: unknown;
 }
 
 export interface PostCaptureRemixResult {
-  /** Same W as round 1; H row 0 from second video; rows 1–2 from round 1. */
   audio: AudioNmfFactorization;
+  newTargetMono: Float32Array;
   remixedMono: Float32Array;
   sampleRate: number;
+  mode: 'fixed-w' | 'grain-demo';
+  debug: unknown;
 }
 
-/** Report pipeline phase to UI (e.g. loading overlay). */
 export type CaptureNmfStepReporter = (headline: string, body: string) => void | Promise<void>;
 
 async function yieldToBrowser(): Promise<void> {
@@ -80,9 +90,7 @@ function tensorWFromColumns(wColumns: number[][]): tf.Tensor2D {
   const f = wColumns[0]!.length;
   const data = new Float32Array(f * k);
   for (let i = 0; i < f; i++) {
-    for (let j = 0; j < k; j++) {
-      data[i * k + j] = wColumns[j]![i]!;
-    }
+    for (let j = 0; j < k; j++) data[i * k + j] = wColumns[j]![i]!;
   }
   return tf.tensor2d(data, [f, k]);
 }
@@ -101,13 +109,243 @@ function tensorHFromRows(rows: number[][]): tf.Tensor2D {
   return tf.tensor2d(data, [k, n]);
 }
 
+function assertFiniteMatrix(name: string, matrix: number[][]): void {
+  if (matrix.length === 0) throw new Error(`${name}: empty matrix`);
+  const cols = matrix[0]?.length ?? 0;
+  if (cols === 0) throw new Error(`${name}: matrix has no frames`);
+  for (let r = 0; r < matrix.length; r++) {
+    if (matrix[r]!.length !== cols) throw new Error(`${name}: ragged row ${r}`);
+    for (let c = 0; c < cols; c++) {
+      if (!Number.isFinite(matrix[r]![c]!)) throw new Error(`${name}: non-finite value at ${r},${c}`);
+    }
+  }
+}
+
+function assertFiniteTensor(name: string, tensor: tf.Tensor): void {
+  const values = tensor.dataSync();
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i]!)) throw new Error(`${name}: NMF returned a non-finite value`);
+  }
+}
+
+function frameDifferencePreserveLength(matrix: number[][]): number[][] {
+  assertFiniteMatrix('video matrix', matrix);
+  const rowCount = matrix.length;
+  const frameCount = matrix[0]!.length;
+  if (frameCount < 3) throw new Error(`Need at least 3 captured frames; got ${frameCount}.`);
+
+  const diff = Array.from({ length: rowCount }, () => new Array<number>(frameCount).fill(0));
+  let maxVal = 0;
+  for (let r = 0; r < rowCount; r++) {
+    const src = matrix[r]!;
+    const dst = diff[r]!;
+    for (let t = 1; t < frameCount; t++) {
+      const v = Math.abs(src[t]! - src[t - 1]!);
+      dst[t] = v;
+      if (v > maxVal) maxVal = v;
+    }
+  }
+
+  if (maxVal > 0) {
+    for (const row of diff) {
+      for (let t = 0; t < row.length; t++) row[t] = row[t]! / maxVal;
+    }
+  }
+  return diff;
+}
+
+function normalizeMinMax(values: number[]): number[] {
+  if (values.length === 0) return [];
+  let min = Infinity;
+  let max = -Infinity;
+  for (const v of values) {
+    if (Number.isFinite(v)) {
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+    return values.map(() => 0);
+  }
+  return values.map(v => (Number.isFinite(v) ? (v - min) / (max - min) : 0));
+}
+
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)));
+  return sorted[idx]!;
+}
+
+function positiveDerivative(values: number[]): number[] {
+  return values.map((v, i) => Math.max(0, v - (values[i - 1] ?? 0)));
+}
+
+function smooth3(values: number[]): number[] {
+  return values.map((v, i) => {
+    const prev = values[i - 1] ?? v;
+    const next = values[i + 1] ?? v;
+    return prev * 0.25 + v * 0.5 + next * 0.25;
+  });
+}
+
+function shapeVisualPrior(values: number[]): number[] {
+  const base = normalizeMinMax(values);
+  const gate = Math.max(0.15, percentile(base, 0.6));
+  const gated = base.map(v => (v >= gate ? (v - gate) / Math.max(1 - gate, 1e-6) : 0));
+  const transient = positiveDerivative(gated).map((v, i) => v + gated[i]! * 0.2);
+  const shaped = normalizeMinMax(smooth3(transient));
+  const peak = Math.max(...shaped, 0);
+  return peak > 0 ? shaped : base;
+}
+
+function circularShift(values: number[], amount: number): number[] {
+  if (values.length === 0) return [];
+  const n = values.length;
+  const shift = ((amount % n) + n) % n;
+  return values.map((_, i) => values[(i - shift + n) % n]!);
+}
+
+function dot(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  let out = 0;
+  for (let i = 0; i < n; i++) out += a[i]! * b[i]!;
+  return out;
+}
+
+function cosineSimilarity(aIn: number[], bIn: number[]): number {
+  const a = normalizeMinMax(aIn);
+  const b = normalizeMinMax(bIn);
+  const denom = Math.sqrt(dot(a, a) * dot(b, b));
+  return denom > 1e-12 ? dot(a, b) / denom : 0;
+}
+
+function pearsonSimilarity(aIn: number[], bIn: number[]): number {
+  const n = Math.min(aIn.length, bIn.length);
+  if (n < 2) return 0;
+  const a = normalizeMinMax(aIn).slice(0, n);
+  const b = normalizeMinMax(bIn).slice(0, n);
+  const meanA = a.reduce((s, v) => s + v, 0) / n;
+  const meanB = b.reduce((s, v) => s + v, 0) / n;
+  let num = 0;
+  let denA = 0;
+  let denB = 0;
+  for (let i = 0; i < n; i++) {
+    const da = a[i]! - meanA;
+    const db = b[i]! - meanB;
+    num += da * db;
+    denA += da * da;
+    denB += db * db;
+  }
+  const denom = Math.sqrt(denA * denB);
+  return denom > 1e-12 ? num / denom : 0;
+}
+
+function scoreComponents(hRows: number[][], visualPrior: number[]): ComponentSimilarityScore[] {
+  const shiftedPrior = circularShift(visualPrior, Math.max(1, Math.floor(visualPrior.length / 2)));
+  return hRows.map((row, componentIndex) => {
+    const cosine = cosineSimilarity(row, visualPrior);
+    const onsetCosine = cosineSimilarity(positiveDerivative(row), positiveDerivative(visualPrior));
+    const pearson = pearsonSimilarity(row, visualPrior);
+    const shiftedScore =
+      0.6 * cosineSimilarity(row, shiftedPrior) +
+      0.4 * cosineSimilarity(positiveDerivative(row), positiveDerivative(shiftedPrior));
+    return {
+      componentIndex,
+      cosine,
+      onsetCosine,
+      pearson,
+      score: 0.6 * cosine + 0.4 * onsetCosine,
+      shiftedScore,
+    };
+  });
+}
+
+function chooseSelectedComponent(scores: ComponentSimilarityScore[]): number {
+  if (scores.length === 0) throw new Error('No audio NMF components to score.');
+  return [...scores].sort((a, b) => b.score - a.score)[0]!.componentIndex;
+}
+
+function makeNullLabel(selected: ComponentSimilarityScore, shiftedBest: number): string {
+  const margin = selected.score - shiftedBest;
+  return `Demo evidence: selected score ${selected.score.toFixed(3)} vs circular-shift best ${shiftedBest.toFixed(3)} (margin ${margin >= 0 ? '+' : ''}${margin.toFixed(3)}).`;
+}
+
+function scalePriorToRow(prior: number[], referenceRow: number[]): number[] {
+  const priorSum = prior.reduce((s, v) => s + Math.max(0, v), 0);
+  const refSum = referenceRow.reduce((s, v) => s + Math.max(0, v), 0);
+  if (priorSum <= 1e-9 || refSum <= 1e-9) return referenceRow.map(() => 0);
+  const scale = refSum / priorSum;
+  return prior.map(v => Math.max(0, v) * scale);
+}
+
+function detectPeaks(values: number[], maxPeaks: number): number[] {
+  const norm = normalizeMinMax(values);
+  const threshold = Math.max(0.25, percentile(norm, 0.72));
+  const peaks: number[] = [];
+  for (let i = 1; i < norm.length - 1; i++) {
+    if (norm[i]! >= threshold && norm[i]! >= norm[i - 1]! && norm[i]! >= norm[i + 1]!) {
+      peaks.push(i);
+    }
+  }
+  return peaks
+    .sort((a, b) => norm[b]! - norm[a]!)
+    .slice(0, maxPeaks)
+    .sort((a, b) => a - b);
+}
+
+function makeGrainDemo(
+  selectedComponentMono: Float32Array,
+  residualMono: Float32Array,
+  visualPrior: number[],
+  sampleRate: number,
+): { newTargetMono: Float32Array; remixedMono: Float32Array } {
+  const out = new Float32Array(residualMono.length);
+  const grainLength = Math.max(256, Math.round(sampleRate * 0.12));
+  const half = Math.floor(grainLength / 2);
+  const srcPeakSample = selectedComponentMono.reduce(
+    (best, v, i) => (Math.abs(v) > Math.abs(selectedComponentMono[best] ?? 0) ? i : best),
+    0,
+  );
+  const srcStart = Math.max(0, Math.min(selectedComponentMono.length - grainLength, srcPeakSample - half));
+  const onsets = detectPeaks(visualPrior, 18);
+
+  for (const frameIdx of onsets) {
+    const center = Math.round((frameIdx / Math.max(visualPrior.length - 1, 1)) * out.length);
+    const dstStart = center - half;
+    for (let i = 0; i < grainLength; i++) {
+      const dst = dstStart + i;
+      const src = srcStart + i;
+      if (dst < 0 || dst >= out.length || src < 0 || src >= selectedComponentMono.length) continue;
+      const win = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(grainLength - 1, 1));
+      out[dst] += selectedComponentMono[src]! * win;
+    }
+  }
+
+  const target = MatrixManager.limitPeak(out, 0.98, 0.18);
+  const mix = MatrixManager.mixMono(residualMono, target.samples, 0.98);
+  return { newTargetMono: target.samples, remixedMono: mix.samples };
+}
+
+function baseDebug(audio: AudioNmfFactorization, extra: Record<string, unknown> = {}) {
+  return {
+    selectedComponentIndex: audio.selectedComponentIndex,
+    componentScores: audio.componentScores,
+    shiftedPriorBestScore: audio.shiftedPriorBestScore,
+    nullComparisonLabel: audio.nullComparisonLabel,
+    reconstructionError: audio.reconstructionError,
+    peaks: {
+      original: audio.originalPeak,
+      selectedComponent: audio.selectedComponentPeak,
+      residual: audio.residualPeak,
+      round2Target: audio.round2TargetPeak,
+      round2Remix: audio.round2RemixPeak,
+    },
+    ...extra,
+  };
+}
+
 export class PostCaptureNmfOrchestrator {
-  /**
-   * Both video and audio factorizations use `chooseBestNmmf` (multiple random restarts, lowest KL).
-   *
-   * @param onStep optional UI hook; called before each heavy block. Waits one animation frame after each
-   *   report so the overlay can paint between synchronous TF steps.
-   */
   static async run(
     videoMatrix: number[][],
     audioMono: Float32Array,
@@ -124,122 +362,118 @@ export class PostCaptureNmfOrchestrator {
       nRestarts: POST_CAPTURE_NMF.N_RESTARTS,
     };
 
-    let xTensor: tf.Tensor2D | null = tf.tensor2d(videoMatrix);
+    let xTensor: tf.Tensor2D | null = null;
+    let motionTensor: tf.Tensor2D | null = null;
     let D: tf.Tensor2D | null = null;
-    let hInit: tf.Tensor2D | null = null;
 
     try {
-      await report(
-        'Video NMF',
-        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} random restarts, k=${POST_CAPTURE_NMF.VIDEO_K}, keep lowest reconstruction error.`,
-      );
-      const vid = MatrixManager.chooseBestNmmf(
-        xTensor,
-        POST_CAPTURE_NMF.VIDEO_K,
-        undefined,
-        bestOpts,
-      );
+      await report('Video motion', 'Frame differencing with preserved frame count; raw appearance pixels are not used for the main visual path.');
+      const motionMatrix = frameDifferencePreserveLength(videoMatrix);
+      motionTensor = tf.tensor2d(motionMatrix);
+
+      await report('Video NMF', `Motion matrix NMF: k=${POST_CAPTURE_NMF.VIDEO_K}, ${POST_CAPTURE_NMF.N_RESTARTS} restarts.`);
+      xTensor = motionTensor;
+      motionTensor = null;
+      const vid = MatrixManager.chooseBestNmmf(xTensor, POST_CAPTURE_NMF.VIDEO_K, undefined, bestOpts);
+      assertFiniteTensor('video W', vid.w);
+      assertFiniteTensor('video H', vid.h);
       xTensor.dispose();
       xTensor = null;
 
-      await report(
-        'Video activation',
-        'process_activation: H_video row with the largest temporal peak (raw row, no gating).',
-      );
-      const processedVideoActivation = MatrixManager.processActivation(vid.h);
+      await report('Visual prior', 'Dominant motion activation, gate/normalize, then transient-shape for onset-like timing.');
+      const videoActivationTensor = MatrixManager.processActivation(vid.h);
       vid.w.dispose();
       vid.h.dispose();
+      const visualActivationFrames = Array.from(videoActivationTensor.dataSync());
+      videoActivationTensor.dispose();
+      const shapedVisualFrames = shapeVisualPrior(visualActivationFrames);
 
-      await report(
-        'STFT',
-        'process_audio_mono: magnitude |D|, n_fft / hop_length per MatrixManager (centered zero-pad).',
-      );
-      D = MatrixManager.processAudioMono(audioMono);
+      await report('STFT', 'Magnitude STFT for blind audio NMF; KL is diagnostic, not a separation claim.');
+      const stft = MatrixManager.stftMagnitudeAndComplex(audioMono);
+      D = stft.D;
+      stft.stftComplex.dispose();
 
-      await report(
-        'Upscale & h_init',
-        'upscale_activation to |D| time frames; row 0 = upscaled stem, rows 1–2 random Uniform(0,1).',
-      );
-      const upRow = MatrixManager.upscaleActivation(processedVideoActivation, D);
-      processedVideoActivation.dispose();
-
-      const nFrames = D.shape[1]!;
-      const upData = Array.from(upRow.dataSync());
+      const visualTensor = tf.tensor1d(shapedVisualFrames);
+      const upRow = MatrixManager.upscaleActivation(visualTensor, D);
+      visualTensor.dispose();
+      const visualPrior = shapeVisualPrior(Array.from(upRow.dataSync()));
       upRow.dispose();
 
-      const row0 = tf.tensor2d([upData], [1, nFrames]);
-      const randRest = MatrixManager.randomUniform2d(POST_CAPTURE_NMF.AUDIO_K - 1, nFrames, Math.random);
-      hInit = tf.concat([row0, randRest], 0) as tf.Tensor2D;
-      row0.dispose();
-      randRest.dispose();
+      await report('Audio NMF', `Blind audio NMF: k=${POST_CAPTURE_NMF.AUDIO_K}, ${POST_CAPTURE_NMF.N_RESTARTS} restarts. Component identity is selected after fitting.`);
+      const audioBest = MatrixManager.chooseBestNmmf(D, POST_CAPTURE_NMF.AUDIO_K, undefined, bestOpts);
+      assertFiniteTensor('audio W', audioBest.w);
+      assertFiniteTensor('audio H', audioBest.h);
 
-      await report(
-        'Audio NMF',
-        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} restarts, k=${POST_CAPTURE_NMF.AUDIO_K}; alpha mode — α·h_init[0,:] on H[0,:] before row-sum scale, first half of iterations only (default α=${NMF_ALPHA_PRIOR_DEFAULT}).`,
-      );
-      const audioBest = MatrixManager.chooseBestNmmf(
-        D,
-        POST_CAPTURE_NMF.AUDIO_K,
-        hInit,
-        {
-          ...bestOpts,
-          nnmfOptions: { alpha: true },
-        },
-      );
-      hInit.dispose();
-      hInit = null;
-      D.dispose();
-      D = null;
+      await report('Component selection', 'Score every fitted H row against the shaped visual prior; choose the visual-matched component.');
+      const wColumns = extractWColumns(audioBest.w);
+      const hRows = extractHRows(audioBest.h);
+      const componentScores = scoreComponents(hRows, visualPrior);
+      const selectedComponentIndex = chooseSelectedComponent(componentScores);
+      const selectedScore = componentScores.find(s => s.componentIndex === selectedComponentIndex)!;
+      const shiftedPriorBestScore = Math.max(...componentScores.map(s => s.shiftedScore));
+      const nullComparisonLabel = makeNullLabel(selectedScore, shiftedPriorBestScore);
 
-      await report(
-        'Residual audio (no comp 0)',
-        'ISTFT: magnitude WH with row/column 0 removed, phase from original STFT → WAV export.',
-      );
-      const residualNoComp0Mono = MatrixManager.synthesizeMonoExcludingLeadingHRows(
+      await report('Ratio-mask resynthesis', 'Selected component and residual use ratio masks with original phase, then peak limiting for playback.');
+      const resynth = MatrixManager.synthesizeComponentAndResidualRatioMask(
         audioMono,
         audioBest.w,
         audioBest.h,
-        1,
+        selectedComponentIndex,
       );
 
-      const wColumns = extractWColumns(audioBest.w);
-      const hRows = extractHRows(audioBest.h);
       const err = audioBest.error;
       audioBest.w.dispose();
       audioBest.h.dispose();
+      D.dispose();
+      D = null;
 
       const freqBins = wColumns[0]?.length ?? 0;
       const timeFrames = hRows[0]?.length ?? 0;
+      const audio: AudioNmfFactorization = {
+        freqBins,
+        timeFrames,
+        wColumns,
+        hRows,
+        visualPrior,
+        visualActivationFrames: shapedVisualFrames,
+        selectedComponentIndex,
+        componentScores,
+        shiftedPriorBestScore,
+        nullComparisonLabel,
+        reconstructionError: err,
+        originalPeak: MatrixManager.peak(audioMono),
+        selectedComponentPeak: resynth.selectedComponentPeak,
+        residualPeak: resynth.residualPeak,
+      };
 
       return {
-        audio: {
-          freqBins,
-          timeFrames,
-          wColumns,
-          hRows,
-          hInitUpscaledRow: upData,
-          reconstructionError: err,
-        },
-        residualNoComp0Mono,
+        audio,
+        selectedComponentMono: resynth.selectedComponentMono,
+        residualMono: resynth.residualMono,
         sampleRate,
+        debug: baseDebug(audio, {
+          videoFrames: videoMatrix[0]?.length ?? 0,
+          videoRows: videoMatrix.length,
+          motionPath: 'frameDifferencePreserveLength',
+          selectedComponentWasSilent: resynth.selectedComponentWasSilent,
+          residualWasSilent: resynth.residualWasSilent,
+        }),
       };
     } catch (e) {
       xTensor?.dispose();
+      motionTensor?.dispose();
       D?.dispose();
-      hInit?.dispose();
       throw e;
     }
   }
 
-  /**
-   * Second capture: video NMF on new WebM → upscale activation; **W** and **H[1,:], H[2,:]** from
-   * round-one `audio`; **H[0,:]** from the new video. ISTFT(|W H|, original-mono phase).
-   */
   static async runRound2Remix(
     videoMatrix: number[][],
     audioMono: Float32Array,
     sampleRate: number,
     round1Audio: AudioNmfFactorization,
+    round1SelectedComponentMono: Float32Array,
+    round1ResidualMono: Float32Array,
     onStep?: CaptureNmfStepReporter,
   ): Promise<PostCaptureRemixResult> {
     const report = async (headline: string, body: string) => {
@@ -252,110 +486,129 @@ export class PostCaptureNmfOrchestrator {
       nRestarts: POST_CAPTURE_NMF.N_RESTARTS,
     };
 
-    let xTensor: tf.Tensor2D | null = tf.tensor2d(videoMatrix);
+    let xTensor: tf.Tensor2D | null = null;
     let D: tf.Tensor2D | null = null;
     let wTensor: tf.Tensor2D | null = null;
     let hTensor: tf.Tensor2D | null = null;
-    let magHat: tf.Tensor2D | null = null;
-    let stftComplex: tf.Tensor | null = null;
+    let targetMag: tf.Tensor2D | null = null;
 
     try {
-      await report(
-        'Round 2 · Video NMF',
-        `choose_best_nmmf: ${POST_CAPTURE_NMF.N_RESTARTS} restarts, k=${POST_CAPTURE_NMF.VIDEO_K} on new capture.`,
-      );
-      const vid = MatrixManager.chooseBestNmmf(
-        xTensor,
-        POST_CAPTURE_NMF.VIDEO_K,
-        undefined,
-        bestOpts,
-      );
+      await report('Round 2 video motion', 'New gesture uses the same motion-first frame-difference path.');
+      const motionMatrix = frameDifferencePreserveLength(videoMatrix);
+      xTensor = tf.tensor2d(motionMatrix);
+
+      await report('Round 2 video NMF', `Motion matrix NMF: k=${POST_CAPTURE_NMF.VIDEO_K}, ${POST_CAPTURE_NMF.N_RESTARTS} restarts.`);
+      const vid = MatrixManager.chooseBestNmmf(xTensor, POST_CAPTURE_NMF.VIDEO_K, undefined, bestOpts);
+      assertFiniteTensor('round 2 video W', vid.w);
+      assertFiniteTensor('round 2 video H', vid.h);
       xTensor.dispose();
       xTensor = null;
 
-      await report(
-        'Round 2 · Video activation',
-        'process_activation: dominant H_video row → upscale to spectrogram time (new H row 0).',
-      );
-      const processedVideoActivation = MatrixManager.processActivation(vid.h);
+      const videoActivationTensor = MatrixManager.processActivation(vid.h);
       vid.w.dispose();
       vid.h.dispose();
+      const visualActivationFrames = Array.from(videoActivationTensor.dataSync());
+      videoActivationTensor.dispose();
+      const shapedVisualFrames = shapeVisualPrior(visualActivationFrames);
 
-      await report('Round 2 · STFT', 'Same |D| framing as round 1 (centered STFT on original mix).');
-      const bundle = MatrixManager.stftMagnitudeAndComplex(audioMono);
-      D = bundle.D;
-      stftComplex = bundle.stftComplex;
-      const meta = bundle.meta;
-
+      await report('Round 2 visual prior', 'Upscale the new gesture timing to the original STFT frame grid.');
+      const stft = MatrixManager.stftMagnitudeAndComplex(audioMono);
+      D = stft.D;
+      stft.stftComplex.dispose();
       const nFrames = D.shape[1]!;
       const fBins = D.shape[0]!;
 
       if (round1Audio.timeFrames !== nFrames || round1Audio.freqBins !== fBins) {
         throw new Error(
-          `Round 2 remix: round-1 factors (${round1Audio.freqBins}×${round1Audio.timeFrames}) ` +
-            `do not match current STFT (${fBins}×${nFrames}). Load the same track or run round 1 again.`,
+          `Round 2 remix: round-1 factors (${round1Audio.freqBins}x${round1Audio.timeFrames}) do not match current STFT (${fBins}x${nFrames}).`,
         );
       }
 
-      if (round1Audio.hRows.length < 3) {
-        throw new Error('Round 2 remix: round-1 H must have 3 rows.');
+      const selected = round1Audio.selectedComponentIndex;
+      if (!Number.isInteger(selected) || selected < 0 || selected >= round1Audio.hRows.length) {
+        throw new Error('Round 2 remix: missing selectedComponentIndex from Round 1.');
       }
 
-      const upRow = MatrixManager.upscaleActivation(processedVideoActivation, D);
-      processedVideoActivation.dispose();
-
-      const upData = Array.from(upRow.dataSync());
+      const visualTensor = tf.tensor1d(shapedVisualFrames);
+      const upRow = MatrixManager.upscaleActivation(visualTensor, D);
+      visualTensor.dispose();
+      const visualPrior = shapeVisualPrior(Array.from(upRow.dataSync()));
       upRow.dispose();
 
-      const h1 = round1Audio.hRows[1]!;
-      const h2 = round1Audio.hRows[2]!;
-      if (h1.length !== nFrames || h2.length !== nFrames) {
-        throw new Error('Round 2 remix: stored H rows 1–2 length mismatch.');
-      }
-
-      await report(
-        'Round 2 · Remixing audio',
-        'W from round 1; H[0] = new video stem; H[1],H[2] unchanged; ISTFT with original phase → play + WAV.',
-      );
-
+      await report('Round 2 fixed-W remix', 'Reuse the selected W column from Round 1; replace only the selected H row with new gesture timing.');
+      const hRows = round1Audio.hRows.map(row => [...row]);
+      hRows[selected] = scalePriorToRow(visualPrior, round1Audio.hRows[selected]!);
       wTensor = tensorWFromColumns(round1Audio.wColumns);
-      hTensor = tensorHFromRows([upData, h1, h2]);
+      hTensor = tensorHFromRows(hRows);
 
       const errTensor = MatrixManager.reconstructionError(D, wTensor, hTensor);
       const reconstructionError = errTensor.dataSync()[0]!;
       errTensor.dispose();
 
-      magHat = tf.matMul(wTensor, hTensor) as tf.Tensor2D;
-      const remixedMono = MatrixManager.istftMagnitudeWithOriginalPhase(magHat, stftComplex, meta);
+      targetMag = tf.tidy(() => {
+        const wj = tf.slice(wTensor!, [0, selected], [fBins, 1]);
+        const hj = tf.slice(hTensor!, [selected, 0], [1, nFrames]);
+        return tf.matMul(wj, hj) as tf.Tensor2D;
+      });
 
+      const targetRaw = MatrixManager.synthesizeMagnitudeWithOriginalPhase(audioMono, targetMag);
+      const targetLimited = MatrixManager.limitPeak(targetRaw, 0.98, 0.18);
+      let newTargetMono = targetLimited.samples;
+      let remixedMono = MatrixManager.mixMono(round1ResidualMono, newTargetMono, 0.98).samples;
+      let mode: 'fixed-w' | 'grain-demo' = 'fixed-w';
+
+      if (targetLimited.wasSilent || targetLimited.outputPeak < 1e-4) {
+        await report('Round 2 grain demo mode', 'Fixed-W target was silent, so short grains from the selected component are triggered by new gesture onsets.');
+        const grain = makeGrainDemo(round1SelectedComponentMono, round1ResidualMono, visualPrior, sampleRate);
+        newTargetMono = grain.newTargetMono;
+        remixedMono = grain.remixedMono;
+        mode = 'grain-demo';
+      }
+
+      const componentScores = scoreComponents(hRows, visualPrior);
+      const shiftedPriorBestScore = Math.max(...componentScores.map(s => s.shiftedScore));
+      const selectedScore = componentScores.find(s => s.componentIndex === selected)!;
+      const round2Audio: AudioNmfFactorization = {
+        ...round1Audio,
+        hRows,
+        visualPrior,
+        visualActivationFrames: shapedVisualFrames,
+        componentScores,
+        shiftedPriorBestScore,
+        nullComparisonLabel: makeNullLabel(selectedScore, shiftedPriorBestScore),
+        reconstructionError,
+        round2TargetPeak: MatrixManager.peak(newTargetMono),
+        round2RemixPeak: MatrixManager.peak(remixedMono),
+        round2Mode: mode,
+      };
+
+      targetMag.dispose();
+      targetMag = null;
       wTensor.dispose();
       wTensor = null;
       hTensor.dispose();
       hTensor = null;
-      magHat.dispose();
-      magHat = null;
       D.dispose();
       D = null;
-      stftComplex.dispose();
-      stftComplex = null;
 
-      const audio: AudioNmfFactorization = {
-        freqBins: fBins,
-        timeFrames: nFrames,
-        wColumns: round1Audio.wColumns,
-        hRows: [upData, Array.from(h1), Array.from(h2)],
-        hInitUpscaledRow: upData,
-        reconstructionError,
+      return {
+        audio: round2Audio,
+        newTargetMono,
+        remixedMono,
+        sampleRate,
+        mode,
+        debug: baseDebug(round2Audio, {
+          round2Mode: mode,
+          selectedComponentIndex: selected,
+          videoFrames: videoMatrix[0]?.length ?? 0,
+        }),
       };
-
-      return { audio, remixedMono, sampleRate };
     } catch (e) {
       xTensor?.dispose();
       D?.dispose();
       wTensor?.dispose();
       hTensor?.dispose();
-      magHat?.dispose();
-      stftComplex?.dispose();
+      targetMag?.dispose();
       throw e;
     }
   }

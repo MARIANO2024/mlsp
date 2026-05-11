@@ -1,21 +1,3 @@
-// =============================================================================
-// App.tsx
-// =============================================================================
-//
-// CONNECTION CHAINS:
-//
-//  CAMERA:
-//   App mounts → useSyncCaptureSession → startCamera → videoManager.initialize()
-//     → getUserMedia() → MediaStream → videoManager.attachToElement(videoRef)
-//
-//  AUDIO:
-//   User selects file → audioManager.load → playSequence schedules Web Audio
-//
-//  VIDEO SYNC:
-//   Second play wall window → SecondPlayRecorder (MediaRecorder) + post-capture NMF pipeline
-//
-// =============================================================================
-
 import './index.css';
 import { musicFiles } from './musicFiles';
 import { useSyncCaptureSession } from './capture/useSyncCaptureSession';
@@ -29,6 +11,7 @@ import { ControlButtons } from './ui/ControlButtons';
 import { MatrixPreviewStrip } from './ui/MatrixPreviewStrip';
 import { NmfPlotsSection } from './ui/NmfPlotsSection';
 import { ProcessingOverlay } from './ui/ProcessingOverlay';
+import { AudioArtifactsPanel } from './ui/AudioArtifactsPanel';
 
 function App() {
   const session = useSyncCaptureSession();
@@ -44,9 +27,9 @@ function App() {
         flexDirection: 'column',
         alignItems: 'center',
         justifyContent: 'flex-start',
-        paddingTop: '2vh',
-        paddingBottom: '4vh',
-        backgroundColor: '#0f0f13',
+        paddingTop: '3vh',
+        paddingBottom: '5vh',
+        backgroundColor: 'transparent',
       }}
     >
       <CameraPanel
@@ -99,20 +82,22 @@ function App() {
 
       {session.audioNmf && <NmfPlotsSection width={w} audio={session.audioNmf} />}
 
+      <AudioArtifactsPanel width={w} artifacts={session.audioArtifacts} />
+
       <div
         style={{
           width: w,
           marginTop: '14px',
           textAlign: 'center',
           fontSize: '13px',
-          color: '#666',
+          color: 'var(--ink-muted)',
           minHeight: '18px',
         }}
       >
         {session.selectedAudio && (
           <span>
             Now playing:{' '}
-            <span style={{ color: session.isPlaying ? '#a0a0ff' : '#999' }}>
+            <span style={{ color: session.isPlaying ? 'var(--accent)' : 'var(--ink-body)' }}>
               {session.selectedAudio}
             </span>
           </span>

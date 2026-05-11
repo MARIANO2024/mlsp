@@ -8,60 +8,67 @@ export interface PlaybackBarsProps {
 }
 
 export function PlaybackBars({ width, timeline, phaseLabel, elapsedLabel }: PlaybackBarsProps) {
+  const overallProgress =
+    timeline.totalSeconds > 0 ? Math.min(timeline.elapsedSeconds / timeline.totalSeconds, 1) : 0;
+
+  const phaseColor =
+    phaseLabel === 'PREVIEW'
+      ? 'var(--accent)'
+      : phaseLabel === 'GAP'
+        ? 'var(--accent-warm)'
+        : phaseLabel === 'CAPTURE'
+          ? 'var(--success)'
+          : phaseLabel === 'PROCESSING'
+            ? '#6a7f9b'
+            : 'var(--border-strong)';
+
   return (
     <>
       <div
         style={{
           width,
-          height: '6px',
           marginTop: '10px',
-          backgroundColor: '#1a1a2e',
-          borderRadius: '2px',
-          overflow: 'hidden',
+          padding: '12px 14px',
+          borderRadius: '14px',
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-soft)',
+          boxShadow: 'var(--shadow-soft)',
         }}
       >
         <div
           style={{
-            height: '100%',
-            width: `${timeline.playProgress * 100}%`,
-            backgroundColor: '#a0a0ff',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: '10px',
+            color: 'var(--ink-body)',
+            fontSize: '12px',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
           }}
-        />
-      </div>
-
-      <div
-        style={{
-          width,
-          height: '6px',
-          marginTop: '16px',
-          backgroundColor: '#1a1a2e',
-          borderRadius: '2px',
-          overflow: 'hidden',
-        }}
-      >
+        >
+          <span>{phaseLabel}</span>
+          <span>{elapsedLabel}</span>
+        </div>
         <div
           style={{
-            height: '100%',
-            width: `${timeline.gapProgress * 100}%`,
-            backgroundColor: '#e5a050',
+            height: '10px',
+            backgroundColor: 'var(--bg-surface-2)',
+            borderRadius: '999px',
+            overflow: 'hidden',
+            border: '1px solid var(--border-soft)',
           }}
-        />
-      </div>
-
-      <div
-        style={{
-          width,
-          marginTop: '10px',
-          display: 'flex',
-          justifyContent: 'space-between',
-          color: '#8585a8',
-          fontSize: '12px',
-          letterSpacing: '0.04em',
-          textTransform: 'uppercase',
-        }}
-      >
-        <span>{phaseLabel}</span>
-        <span>{elapsedLabel}</span>
+        >
+          <div
+            style={{
+              height: '100%',
+              width: `${overallProgress * 100}%`,
+              background: `linear-gradient(90deg, ${phaseColor} 0%, color-mix(in srgb, ${phaseColor} 65%, white) 100%)`,
+              borderRadius: '999px',
+              transition: 'width 0.15s linear, background 0.15s linear',
+            }}
+          />
+        </div>
       </div>
     </>
   );

@@ -76,7 +76,7 @@ export class SecondPlayRecorder {
     onWaiting();
 
     const startDelayMs = Math.max(windowInfo.startWallMs - performance.now(), 0);
-    const stopDelayMs = startDelayMs + windowInfo.durationSeconds * 1000;
+    const stopDelayMs = Math.max(windowInfo.endWallMs - performance.now(), 0);
 
     const startTimer = window.setTimeout(() => {
       if (epochAtSchedule !== this.sessionEpoch || recorder.state !== 'inactive') return;

@@ -11,15 +11,19 @@ import { downloadBlob } from '../lib/download';
 import { extractVideoMatrix, type PreviewFrame } from './videoMatrix';
 import { getSupportedVideoMimeType } from './videoMimeType';
 import {
+  makeNmfDebugFilename,
   makeMatrixFilename,
   makePlay2WebmRecordingName,
   makeRemixWavFilename,
+  makeRound2TargetWavFilename,
   makeResidualWavFilename,
+  makeSelectedComponentWavFilename,
 } from './recordingFilenames';
 import { formatDelta, formatMasterTime } from './syncConsoleFormat';
 import { SecondPlayRecorder } from './SecondPlayRecorder';
 import type { RecordingStatus } from './recordingTypes';
 import { EMPTY_TIMELINE } from '../ui/layoutConstants';
+import type { AudioArtifact } from '../ui/AudioArtifactsPanel';
 
 export function useSyncCaptureSession() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -35,11 +39,12 @@ export function useSyncCaptureSession() {
 
   const [showFileList, setShowFileList] = useState(false);
   const [timeline, setTimeline] = useState<PlaybackTimeline>(EMPTY_TIMELINE);
-  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus>('idle');
+  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus>('NOT_RECORDING');
   const [lastRecordingName, setLastRecordingName] = useState<string | null>(null);
   const [matrixShape, setMatrixShape] = useState<string | null>(null);
   const [previewFrames, setPreviewFrames] = useState<PreviewFrame[]>([]);
   const [audioNmf, setAudioNmf] = useState<AudioNmfFactorization | null>(null);
+  const [audioArtifacts, setAudioArtifacts] = useState<AudioArtifact[]>([]);
   const [isCalculating, setIsCalculating] = useState(false);
   const [captureRoundUi, setCaptureRoundUi] = useState<1 | 2>(1);
   const [capturePipelinePhase, setCapturePipelinePhase] = useState<{
@@ -58,9 +63,60 @@ export function useSyncCaptureSession() {
   const videoStartWallRef = useRef<number | null>(null);
   const videoEndWallRef = useRef<number | null>(null);
   const pendingFilenameRef = useRef<string | null>(null);
+  const artifactObjectUrlsRef = useRef<string[]>([]);
 
   const TOTAL_PLAYS = 2;
-  const GAP_SECONDS = 2;
+  const GAP_SECONDS = 1;
+
+  const revokeGeneratedArtifactUrls = useCallback(() => {
+    for (const url of artifactObjectUrlsRef.current) URL.revokeObjectURL(url);
+    artifactObjectUrlsRef.current = [];
+  }, []);
+
+  const setOriginalArtifact = useCallback(
+    (filename: string, url: string) => {
+      revokeGeneratedArtifactUrls();
+      setAudioArtifacts([
+        {
+          key: 'original',
+          label: 'Original',
+          url,
+          filename,
+          note: filename,
+        },
+      ]);
+    },
+    [revokeGeneratedArtifactUrls],
+  );
+
+  const keepOnlyOriginalArtifact = useCallback(() => {
+    revokeGeneratedArtifactUrls();
+    setAudioArtifacts(prev => prev.filter(a => a.key === 'original'));
+  }, [revokeGeneratedArtifactUrls]);
+
+  const addWavArtifact = useCallback(
+    (key: string, label: string, samples: Float32Array, sampleRate: number, filename: string, note?: string) => {
+      const wav = encodeWavMono16(samples, sampleRate);
+      const blob = new Blob([wav], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      artifactObjectUrlsRef.current.push(url);
+      downloadBlob(blob, filename);
+      setAudioArtifacts(prev => [
+        ...prev.filter(a => a.key !== key),
+        { key, label, url, filename, note },
+      ]);
+    },
+    [],
+  );
+
+  const downloadDebugJson = useCallback((payload: unknown, filename: string) => {
+    downloadBlob(
+      new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+      filename,
+    );
+  }, []);
+
+  useEffect(() => () => revokeGeneratedArtifactUrls(), [revokeGeneratedArtifactUrls]);
 
   const resetSyncConsole = useCallback((message = 'Sync console reset.') => {
     audioWindowRef.current = null;
@@ -70,14 +126,15 @@ export function useSyncCaptureSession() {
     setMatrixShape(null);
     setPreviewFrames([]);
     setAudioNmf(null);
-  }, []);
+    keepOnlyOriginalArtifact();
+  }, [keepOnlyOriginalArtifact]);
 
   const cancelScheduledRecording = useCallback(
     (updateStatus = true) => {
       secondPlayRecorderRef.current.cancel();
       pendingFilenameRef.current = null;
       if (updateStatus) {
-        setRecordingStatus('idle');
+        setRecordingStatus('NOT_RECORDING');
         setIsCalculating(false);
         setCapturePipelinePhase(null);
         resetSyncConsole('Attempt cancelled; timing console reset.');
@@ -93,6 +150,7 @@ export function useSyncCaptureSession() {
     setAudioNmf(null);
     setLastRecordingName(null);
     setCaptureRoundUi(1);
+    keepOnlyOriginalArtifact();
     if (audioManager.isLoaded()) {
       try {
         audioManager.restoreAnalysisPlayback();
@@ -100,7 +158,7 @@ export function useSyncCaptureSession() {
         /* ignore */
       }
     }
-  }, []);
+  }, [keepOnlyOriginalArtifact]);
 
   const preparePlaybackBufferForCapture = useCallback(() => {
     if (round1BundleRef.current) {
@@ -113,7 +171,14 @@ export function useSyncCaptureSession() {
     }
   }, []);
 
-  const setSyncSummary = useCallback((audioWindow: PlaybackWindow | null, videoStart: number | null, videoEnd: number | null) => {
+  const setSyncSummary = useCallback((
+    audioWindow: PlaybackWindow | null,
+    videoStart: number | null,
+    videoEnd: number | null,
+    matrix?: { frameCount: number; shape: string },
+  ) => {
+    const captureDuration =
+      videoStart != null && videoEnd != null ? `${((videoEnd - videoStart) / 1000).toFixed(3)} s` : 'pending';
     setSyncConsoleLines([
       `audio start: ${formatMasterTime(audioWindow?.startWallMs ?? null)}`,
       `audio end:   ${formatMasterTime(audioWindow?.endWallMs ?? null)}`,
@@ -121,6 +186,9 @@ export function useSyncCaptureSession() {
       `video end:   ${formatMasterTime(videoEnd)}`,
       `start delta: ${formatDelta(videoStart, audioWindow?.startWallMs ?? null)}`,
       `end delta:   ${formatDelta(videoEnd, audioWindow?.endWallMs ?? null)}`,
+      `capture duration: ${captureDuration}`,
+      `frame count: ${matrix?.frameCount ?? 'pending'}`,
+      `matrix shape: ${matrix?.shape ?? 'pending'}`,
     ]);
   }, []);
 
@@ -174,15 +242,16 @@ export function useSyncCaptureSession() {
         windowInfo,
         onWaiting: () => {
           setLastRecordingName(null);
-          setRecordingStatus('waiting');
+          setRecordingStatus('WAITING');
         },
         onRecordingStarted: actualStartWallMs => {
           videoStartWallRef.current = actualStartWallMs;
-          setRecordingStatus('recording');
+          setRecordingStatus('RECORDING');
           setSyncSummary(windowInfo, actualStartWallMs, null);
         },
         onRecorderError: () => {
-          setRecordingStatus('error');
+          setRecordingStatus('ERROR');
+          setSyncConsoleLines(['MediaRecorder failed during capture.']);
         },
         onComplete: async ({ blob, actualStopWallMs }) => {
           const windowInfoSnapshot = windowInfo;
@@ -190,7 +259,7 @@ export function useSyncCaptureSession() {
           videoEndWallRef.current = actualStopWallMs;
           pendingFilenameRef.current = null;
           setSyncSummary(windowInfoSnapshot, videoStartWallRef.current, actualStopWallMs);
-          setRecordingStatus('saving');
+          setRecordingStatus('PROCESSING');
           setIsCalculating(true);
           setCapturePipelinePhase({
             headline: 'Video matrix',
@@ -219,8 +288,13 @@ export function useSyncCaptureSession() {
             downloadBlob(blob, filenameSafe);
             downloadBlob(matrixBlob, matrixFilename);
             setLastRecordingName(matrixFilename);
-            setMatrixShape(`${videoMatrix.width * videoMatrix.height} x ${videoMatrix.frameCount}`);
+            const shape = `${videoMatrix.width * videoMatrix.height} x ${videoMatrix.frameCount}`;
+            setMatrixShape(shape);
             setPreviewFrames(videoMatrix.previews);
+            setSyncSummary(windowInfoSnapshot, videoStartWallRef.current, actualStopWallMs, {
+              frameCount: videoMatrix.frameCount,
+              shape,
+            });
 
             const mono = audioManager.getMonoSamples();
             if (!mono) {
@@ -235,7 +309,13 @@ export function useSyncCaptureSession() {
               });
 
             if (!round1BundleRef.current) {
-              const { audio, residualNoComp0Mono, sampleRate: rateOut } = await PostCaptureNmfOrchestrator.run(
+              const {
+                audio,
+                selectedComponentMono,
+                residualMono,
+                sampleRate: rateOut,
+                debug,
+              } = await PostCaptureNmfOrchestrator.run(
                 videoMatrix.matrix,
                 mono,
                 sampleRate,
@@ -244,29 +324,79 @@ export function useSyncCaptureSession() {
               setAudioNmf(audio);
               round1BundleRef.current = {
                 audio: cloneAudioFactorization(audio),
-                residualMono: Float32Array.from(residualNoComp0Mono),
+                selectedComponentMono: Float32Array.from(selectedComponentMono),
+                residualMono: Float32Array.from(residualMono),
                 sampleRate: rateOut,
               };
               setCaptureRoundUi(2);
-              const residualBuf = encodeWavMono16(residualNoComp0Mono, rateOut);
-              downloadBlob(new Blob([residualBuf], { type: 'audio/wav' }), makeResidualWavFilename(filenameSafe));
+              addWavArtifact(
+                'selected-component',
+                'Extracted selected component',
+                selectedComponentMono,
+                rateOut,
+                makeSelectedComponentWavFilename(filenameSafe),
+                `Selected visual-matched component H[${audio.selectedComponentIndex}]`,
+              );
+              addWavArtifact(
+                'residual',
+                'Residual after removing selected component',
+                residualMono,
+                rateOut,
+                makeResidualWavFilename(filenameSafe),
+                `Ratio-mask residual after H[${audio.selectedComponentIndex}] removal`,
+              );
+              downloadDebugJson(debug, makeNmfDebugFilename(filenameSafe));
             } else {
-              const { remixedMono, sampleRate: rateOut } = await PostCaptureNmfOrchestrator.runRound2Remix(
+              const round1 = round1BundleRef.current;
+              const {
+                audio,
+                newTargetMono,
+                remixedMono,
+                sampleRate: rateOut,
+                mode,
+                debug,
+              } = await PostCaptureNmfOrchestrator.runRound2Remix(
                 videoMatrix.matrix,
                 mono,
                 sampleRate,
-                round1BundleRef.current.audio,
+                round1.audio,
+                round1.selectedComponentMono,
+                round1.residualMono,
                 headlineRound2,
               );
-              const remixBuf = encodeWavMono16(remixedMono, rateOut);
-              downloadBlob(new Blob([remixBuf], { type: 'audio/wav' }), makeRemixWavFilename(filenameSafe));
-              resetToCapture1Baseline();
+              setAudioNmf(audio);
+              addWavArtifact(
+                'round2-target',
+                mode === 'grain-demo' ? 'Round 2 new target (grain demo mode)' : 'Round 2 new target',
+                newTargetMono,
+                rateOut,
+                makeRound2TargetWavFilename(filenameSafe),
+                mode === 'grain-demo'
+                  ? 'Grain demo mode: selected Round 1 grains triggered by new gesture onsets'
+                  : `Fixed-W target using selected component H[${audio.selectedComponentIndex}]`,
+              );
+              addWavArtifact(
+                'round2-remix',
+                'Round 2 remix/new gesture result',
+                remixedMono,
+                rateOut,
+                makeRemixWavFilename(filenameSafe),
+                mode === 'grain-demo' ? 'Residual plus gesture-triggered grains' : 'Residual plus fixed-W new target',
+              );
+              downloadDebugJson(debug, makeNmfDebugFilename(filenameSafe));
+              round1BundleRef.current = null;
+              setCaptureRoundUi(1);
+              try {
+                audioManager.restoreAnalysisPlayback();
+              } catch {
+                /* ignore */
+              }
               setLastRecordingName(matrixFilename);
             }
 
-            setRecordingStatus('saved');
+            setRecordingStatus('COMPLETE');
           } catch (err) {
-            setRecordingStatus('error');
+            setRecordingStatus('ERROR');
             if (!round1BundleRef.current) {
               setAudioNmf(null);
             }
@@ -280,7 +410,7 @@ export function useSyncCaptureSession() {
         },
       });
     },
-    [resetToCapture1Baseline, selectedAudio, setSyncSummary],
+    [addWavArtifact, downloadDebugJson, selectedAudio, setSyncSummary],
   );
 
   useEffect(() => {
@@ -338,17 +468,32 @@ export function useSyncCaptureSession() {
       setMatrixShape(null);
       setPreviewFrames([]);
       setAudioNmf(null);
+      setLastRecordingName(null);
+      setRecordingStatus('NOT_RECORDING');
+      setSyncConsoleLines(['Audio selected. Press Play + Capture 1 for preview, 1 second gap, then video capture.']);
+      keepOnlyOriginalArtifact();
 
       try {
         await audioManager.load(url);
         if (requestId !== loadRequestRef.current) return;
         setAudioLoadStatus('ready');
+        setOriginalArtifact(filename, url);
       } catch {
         if (requestId !== loadRequestRef.current) return;
         setAudioLoadStatus('error');
+        setAudioArtifacts([]);
       }
     },
-    [cancelScheduledRecording, isCalculating, isPlaying, setAudioLoadStatus, setSelectedAudio, setIsPlaying],
+    [
+      cancelScheduledRecording,
+      isCalculating,
+      isPlaying,
+      keepOnlyOriginalArtifact,
+      setAudioLoadStatus,
+      setOriginalArtifact,
+      setSelectedAudio,
+      setIsPlaying,
+    ],
   );
 
   const handlePlayStop = useCallback(async () => {
@@ -358,6 +503,11 @@ export function useSyncCaptureSession() {
       cancelScheduledRecording();
       setIsPlaying(false);
       setTimeline(EMPTY_TIMELINE);
+      return;
+    }
+    if (cameraStatus !== 'active' || !videoManager.getStream()) {
+      setRecordingStatus('ERROR');
+      setSyncConsoleLines(['Camera is not active. Allow camera access before running the two-play capture demo.']);
       return;
     }
     try {
@@ -376,8 +526,7 @@ export function useSyncCaptureSession() {
     } catch (err) {
       audioManager.stop();
       cancelScheduledRecording();
-      setRecordingStatus('error');
-      setAudioLoadStatus('error');
+      setRecordingStatus('ERROR');
       setIsPlaying(false);
       setTimeline(EMPTY_TIMELINE);
       setSyncConsoleLines([
@@ -386,11 +535,11 @@ export function useSyncCaptureSession() {
     }
   }, [
     cancelScheduledRecording,
+    cameraStatus,
     isCalculating,
     isPlaying,
     preparePlaybackBufferForCapture,
     scheduleSecondPlayRecording,
-    setAudioLoadStatus,
     setIsPlaying,
   ]);
 
@@ -399,31 +548,31 @@ export function useSyncCaptureSession() {
     isPlaying ? 'Stop' : audioLoadStatus === 'loading' ? '…' : `Play + Capture ${captureRoundUi}`;
   const playDisabled = (audioLoadStatus !== 'ready' && !isPlaying) || isCalculating;
   const controlsLocked = isCalculating;
-  const phaseLabel =
-    timeline.phase === 'audio'
-      ? `Audio ${timeline.currentPlay}/${timeline.totalPlays}`
-      : timeline.phase === 'gap'
-        ? 'Long pause'
-        : timeline.phase === 'lead-in'
-          ? 'Scheduled'
-          : 'Idle';
+  const phaseLabel = (() => {
+    if (isCalculating) return 'PROCESSING';
+    if (recordingStatus === 'COMPLETE') return 'COMPLETE';
+    if (timeline.phase === 'audio' && timeline.currentPlay === 1) return 'PREVIEW';
+    if (timeline.phase === 'gap') return 'GAP';
+    if (timeline.phase === 'audio' && timeline.currentPlay === 2) return 'CAPTURE';
+    return 'IDLE';
+  })();
   const elapsedLabel =
     timeline.totalSeconds > 0
       ? `${timeline.elapsedSeconds.toFixed(2)}s / ${timeline.totalSeconds.toFixed(2)}s`
-      : 'Select an audio file to run the sync proof';
+      : 'Select audio, then run preview / 1s gap / capture';
 
   const recordingLabelDict: Record<RecordingStatus, string> = (() => {
     const c = captureRoundUi;
     return {
-      idle:
+      NOT_RECORDING:
         c === 1
           ? 'Capture 1: start playback to record video on the second play.'
-          : 'Capture 2: start playback (residual track) to record on the second play.',
-      waiting: `Capture ${c}: waiting for second play to start recording.`,
-      recording: `Capture ${c}: recording video now.`,
-      saving: `Capture ${c}: saving video and running pipeline…`,
-      saved: lastRecordingName ? `Saved ${lastRecordingName}` : `Capture ${c} finished.`,
-      error: 'Video capture or pipeline failed.',
+          : 'Capture 2: residual guide will play, then record the new gesture on the second play.',
+      WAITING: `Capture ${c}: waiting for second play to start recording.`,
+      RECORDING: `Capture ${c}: recording video now.`,
+      PROCESSING: `Capture ${c}: decoding video, extracting motion, and running NMF.`,
+      COMPLETE: lastRecordingName ? `COMPLETE: saved ${lastRecordingName}` : `COMPLETE: capture ${c} finished.`,
+      ERROR: 'ERROR: video capture or pipeline failed.',
     };
   })();
 
@@ -461,6 +610,7 @@ export function useSyncCaptureSession() {
     matrixShape,
 
     audioNmf,
+    audioArtifacts,
     isCalculating,
     capturePipelinePhase,
 

@@ -1,13 +1,3 @@
-/**
- * MatrixManager — TensorFlow.js port of the Python pipeline in `final_project.ipynb`
- * (cell: process_video → upscale_activation).
- *
- * STFT: Uses `tf.signal.stft` with `n_fft`, `hop_length`, Hann window, and `fftLength = n_fft`
- * (matches librosa’s default window length = `n_fft`). For `center=True`, librosa applies
- * a specialized edge-padding scheme; here we use symmetric zero-padding of `n_fft // 2`
- * on each end — close for mid-body audio but not bit-identical at all lengths.
- */
-
 import * as tf from '@tensorflow/tfjs';
 
 const EPS = 1e-9;
@@ -43,27 +33,36 @@ export interface StftMagnitudeAndPhase {
   meta: StftIstftMeta;
 }
 
+export interface PeakLimitedAudio {
+  samples: Float32Array;
+  inputPeak: number;
+  outputPeak: number;
+  scale: number;
+  wasSilent: boolean;
+}
+
+export interface RatioMaskResynthesis {
+  selectedComponentMono: Float32Array;
+  residualMono: Float32Array;
+  selectedComponentPeak: number;
+  residualPeak: number;
+  selectedComponentWasSilent: boolean;
+  residualWasSilent: boolean;
+}
+
 export interface ChooseBestNmmfOptions {
   nRestarts?: number;
   nIter?: number;
   rng?: NnmfRng;
-  /** Forwarded to every `nnmf` restart (e.g. `alpha` prior on row 0). */
+  /** Forwarded to every `nnmf` restart. */
   nnmfOptions?: NnmfOptions;
 }
 
 /** Options for multiplicative NMF / KL (`nnmf`). */
 export interface NnmfOptions {
-  /**
-   * When `true` and `h_init` is provided: `H` is fully random; for the **first half** of iterations
-   * (`i * 2 < nIter`), add `alphaAtIter(i) * h_init[0, :]` to `H[0, :]` after the multiplicative **H**
-   * update but **before** the row-sum scale. After halfway, no prior (same as `alphaAtIter === 0`).
-   * When `false` or `h_init` is omitted: same as before (`H` clone or random).
-   */
+  /** Optional legacy visual-prior diagnostic. The main demo uses blind audio NMF and selects components afterward. */
   alpha?: boolean;
-  /**
-   * Prior strength at iteration `iter` (0-based) for `alpha` mode **while `iter * 2 < nIter`**
-   * (no bump in the second half). Defaults to {@link NMF_ALPHA_PRIOR_DEFAULT}.
-   */
+  /** Prior strength at iteration `iter` for legacy alpha mode. */
   alphaAtIter?: (iter: number) => number;
 }
 
@@ -246,17 +245,13 @@ export class MatrixManager {
     return best;
   }
 
-  /**
-   * Pick the row of H with the largest temporal peak (same row choice as the notebook).
-   * Gating and max-normalization (notebook `process_activation`) are temporarily disabled.
-   */
+  /** Pick the strongest video-H row and return a gated, max-normalized activation. */
   static processActivation(h: tf.Tensor2D): tf.Tensor1D {
     return tf.tidy(() => {
       const peakPerRow = tf.max(h, 1);
       const bestIdx = tf.argMax(peakPerRow, 0).dataSync()[0]!;
       const bestRow = tf.slice(h, [bestIdx, 0], [1, h.shape[1]]).squeeze([0]).toFloat();
 
-      // --- Notebook follow-up (gating + scale to [0,1] where range > 0) — commented out for now ---
       const rowMin = tf.min(bestRow);
       const rowMax = tf.max(bestRow);
       const rangeOk = rowMax.sub(rowMin).greater(0);
@@ -265,8 +260,6 @@ export class MatrixManager {
       const gMax = tf.max(gated);
       gated = tf.where(gMax.greater(0), gated.div(gMax), gated);
       return tf.where(rangeOk, gated, tf.zerosLike(bestRow)) as tf.Tensor1D;
-
-      // return bestRow as tf.Tensor1D;
     });
   }
 
@@ -376,10 +369,120 @@ export class MatrixManager {
     return out.slice(pad, pad + originalLength);
   }
 
-  /**
-   * Resynthesize time-domain audio whose STFT magnitude is `W[:, nDrop:] @ H[nDrop:, :]` (KL NMF factors),
-   * using the phase of the original mono STFT. Caller disposes `w` / `h` if appropriate.
-   */
+  static peak(samples: Float32Array): number {
+    let peak = 0;
+    for (const v of samples) {
+      const a = Math.abs(v);
+      if (Number.isFinite(a) && a > peak) peak = a;
+    }
+    return peak;
+  }
+
+  static limitPeak(
+    samples: Float32Array,
+    maxPeak = 0.98,
+    minAudiblePeak = 0,
+  ): PeakLimitedAudio {
+    const inputPeak = MatrixManager.peak(samples);
+    const wasSilent = inputPeak <= 1e-7;
+    let scale = 1;
+
+    if (!wasSilent && inputPeak > maxPeak) {
+      scale = maxPeak / inputPeak;
+    } else if (!wasSilent && minAudiblePeak > 0 && inputPeak < minAudiblePeak) {
+      scale = minAudiblePeak / inputPeak;
+    }
+
+    const out = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const v = samples[i]!;
+      out[i] = Number.isFinite(v) ? v * scale : 0;
+    }
+
+    return {
+      samples: out,
+      inputPeak,
+      outputPeak: MatrixManager.peak(out),
+      scale,
+      wasSilent,
+    };
+  }
+
+  static mixMono(a: Float32Array, b: Float32Array, maxPeak = 0.98): PeakLimitedAudio {
+    const n = Math.max(a.length, b.length);
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = (a[i] ?? 0) + (b[i] ?? 0);
+    return MatrixManager.limitPeak(out, maxPeak);
+  }
+
+  static synthesizeMagnitudeWithOriginalPhase(
+    mono: Float32Array,
+    magnitudeFreqTime: tf.Tensor2D,
+    options: ProcessAudioOptions = {},
+  ): Float32Array {
+    const { D, stftComplex, meta } = MatrixManager.stftMagnitudeAndComplex(mono, options);
+    D.dispose();
+    const wav = MatrixManager.istftMagnitudeWithOriginalPhase(magnitudeFreqTime, stftComplex, meta);
+    stftComplex.dispose();
+    return wav;
+  }
+
+  /** Resynthesize the visually selected component and residual using a ratio mask and original phase. */
+  static synthesizeComponentAndResidualRatioMask(
+    mono: Float32Array,
+    w: tf.Tensor2D,
+    h: tf.Tensor2D,
+    componentIndex: number,
+    options: ProcessAudioOptions = {},
+  ): RatioMaskResynthesis {
+    const [Fw, k] = w.shape;
+    const [kh, T] = h.shape;
+    if (kh !== k) {
+      throw new Error(`ratio-mask resynthesis: W columns ${k} vs H rows ${kh}`);
+    }
+    if (componentIndex < 0 || componentIndex >= k) {
+      throw new Error(`ratio-mask resynthesis: component ${componentIndex} outside 0..${k - 1}`);
+    }
+
+    const { D, stftComplex, meta } = MatrixManager.stftMagnitudeAndComplex(mono, options);
+    const [Fd, Td] = D.shape;
+    if (Fd !== Fw || Td !== T) {
+      D.dispose();
+      stftComplex.dispose();
+      throw new Error(`ratio-mask resynthesis: |D| [${Fd}, ${Td}] vs WH [${Fw}, ${T}]`);
+    }
+
+    const { selectedMag, residualMag } = tf.tidy(() => {
+      const fullMag = tf.matMul(w, h).add(EPS) as tf.Tensor2D;
+      const wj = tf.slice(w, [0, componentIndex], [Fw, 1]);
+      const hj = tf.slice(h, [componentIndex, 0], [1, T]);
+      const compMag = tf.matMul(wj, hj) as tf.Tensor2D;
+      const ratio = tf.minimum(tf.maximum(compMag.div(fullMag), 0), 1) as tf.Tensor2D;
+      const selected = D.mul(ratio) as tf.Tensor2D;
+      const residual = D.mul(tf.scalar(1).sub(ratio)) as tf.Tensor2D;
+      return { selectedMag: selected, residualMag: residual };
+    });
+
+    const selectedRaw = MatrixManager.istftMagnitudeWithOriginalPhase(selectedMag, stftComplex, meta);
+    const residualRaw = MatrixManager.istftMagnitudeWithOriginalPhase(residualMag, stftComplex, meta);
+    selectedMag.dispose();
+    residualMag.dispose();
+    D.dispose();
+    stftComplex.dispose();
+
+    const selected = MatrixManager.limitPeak(selectedRaw, 0.98, 0.18);
+    const residual = MatrixManager.limitPeak(residualRaw, 0.98);
+
+    return {
+      selectedComponentMono: selected.samples,
+      residualMono: residual.samples,
+      selectedComponentPeak: selected.outputPeak,
+      residualPeak: residual.outputPeak,
+      selectedComponentWasSilent: selected.wasSilent,
+      residualWasSilent: residual.wasSilent,
+    };
+  }
+
   static synthesizeMonoExcludingLeadingHRows(
     mono: Float32Array,
     w: tf.Tensor2D,

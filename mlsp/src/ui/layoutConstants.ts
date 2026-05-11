@@ -8,12 +8,14 @@ export const BTN_BASE: CSSProperties = {
   padding: '18px 0',
   fontSize: '16px',
   fontWeight: 600,
-  border: 'none',
+  border: '1px solid var(--border-soft)',
   borderRadius: '10px',
-  color: '#fff',
+  color: 'var(--ink-strong)',
   cursor: 'pointer',
   letterSpacing: '0.5px',
-  transition: 'filter 0.15s',
+  backgroundColor: 'var(--bg-panel)',
+  boxShadow: 'var(--shadow-soft)',
+  transition: 'filter 0.15s, background-color 0.15s, border-color 0.15s',
 };
 
 export const EMPTY_TIMELINE: PlaybackTimeline = {

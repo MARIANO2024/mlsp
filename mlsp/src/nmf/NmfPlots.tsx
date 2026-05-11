@@ -12,12 +12,11 @@ const TOTAL_H = PLOT_H + PAD_T + PAD_B;
 const STROKE_W = 1.8;
 const TICK_LEN = 4;
 const AXIS_FONT = 8;
-const AXIS_COLOR = '#999';
+const AXIS_COLOR = '#938877';
 
 const W_STROKES = ['#3a3aff', '#c46a10', '#1f9e6c'] as const;
 const H_STROKES = ['#3a3aff', '#c46a10', '#1f9e6c'] as const;
-/** Upscaled video init — dashed so it reads as "prior", not a fitted row of H. */
-const H_INIT_STROKE = '#444';
+const VISUAL_PRIOR_STROKE = '#444';
 
 const panelStyle: CSSProperties = {
   width: '100%',
@@ -29,8 +28,8 @@ const panelStyle: CSSProperties = {
 const chartWrapStyle: CSSProperties = {
   borderRadius: '6px',
   overflow: 'hidden',
-  backgroundColor: '#ffffff',
-  border: '1px solid #e0e0e8',
+  backgroundColor: '#fffdf8',
+  border: '1px solid #dfd5c7',
   lineHeight: 0,
 };
 
@@ -101,7 +100,7 @@ function ChartSvg({ children, xCount }: { children: ReactNode; xCount: number })
         role="img"
         style={{ display: 'block' }}
       >
-        <rect x="0" y="0" width={TOTAL_W} height={TOTAL_H} fill="#ffffff" />
+        <rect x="0" y="0" width={TOTAL_W} height={TOTAL_H} fill="#fffdf8" />
         <AxisLayer xCount={xCount} />
         <g transform={`translate(${PAD_L}, ${PAD_T})`}>
           {children}
@@ -112,25 +111,38 @@ function ChartSvg({ children, xCount }: { children: ReactNode; xCount: number })
 }
 
 export function AudioNmfFactorizationPlots({ audio }: { audio: AudioNmfFactorization }) {
-  const { wColumns, hRows, hInitUpscaledRow } = audio;
-  const hInitForOverlay = NmfPlotGeometry.normalizeMinMaxSeries(hInitUpscaledRow);
+  const { wColumns, hRows, visualPrior, selectedComponentIndex } = audio;
+  const visualPriorForOverlay = NmfPlotGeometry.normalizeMinMaxSeries(visualPrior);
   const hRowsForOverlay = hRows.map(r => NmfPlotGeometry.normalizeMinMaxSeries(r));
+  const selectedH = hRows[selectedComponentIndex] ?? [];
+  const selectedHForOverlay = NmfPlotGeometry.normalizeMinMaxSeries(selectedH);
   const overlayYMin = 0;
   const overlayYMax = 1;
+  const selectedScore = audio.componentScores.find(s => s.componentIndex === selectedComponentIndex);
 
   return (
     <div style={panelStyle}>
-      <div style={{ color: '#1a1a1a', fontSize: '12px', textAlign: 'center' }}>
-        Audio NMF on |STFT| — W columns (frequency x component){' '}
-        <span style={{ color: '#666' }}>
+      <div style={{ color: 'var(--ink-strong)', fontSize: '12px', textAlign: 'center' }}>
+        Audio NMF on |STFT| - W columns (frequency x component){' '}
+        <span style={{ color: 'var(--ink-muted)' }}>
           · {audio.freqBins} bins x {audio.timeFrames} frames · KL loss = {audio.reconstructionError.toExponential(4)}
         </span>
+      </div>
+
+      <div style={{ color: 'var(--ink-strong)', fontSize: '12px', textAlign: 'center', lineHeight: 1.5 }}>
+        <strong>Selected visual-matched component:</strong> H[{selectedComponentIndex}, :]
+        {selectedScore && (
+          <span style={{ color: H_STROKES[selectedComponentIndex % H_STROKES.length] }}>
+            {' '}score {selectedScore.score.toFixed(3)}
+          </span>
+        )}
+        <div style={{ color: 'var(--ink-muted)', fontSize: '11px' }}>{audio.nullComparisonLabel}</div>
       </div>
 
       {wColumns.map((col, j) => (
         <div key={`w-${j}`}>
           <div style={{ color: W_STROKES[j % W_STROKES.length]!, fontSize: '12px', marginBottom: '6px' }}>
-            W[:, {j}] (spectral component)
+            W[:, {j}] {j === selectedComponentIndex ? '(selected visual-matched component)' : '(spectral component)'}
           </div>
           <ChartSvg xCount={audio.freqBins}>
             <polyline
@@ -145,22 +157,22 @@ export function AudioNmfFactorizationPlots({ audio }: { audio: AudioNmfFactoriza
       ))}
 
       <div>
-        <div style={{ color: '#1a1a1a', fontSize: '12px', marginBottom: '4px' }}>
-          H activations vs STFT time + upscaled video h_init
+        <div style={{ color: 'var(--ink-strong)', fontSize: '12px', marginBottom: '4px' }}>
+          Visual prior and all H rows
         </div>
-        <div style={{ color: '#555', fontSize: '10px', marginBottom: '8px', lineHeight: 1.35, textAlign: 'center' }}>
-          Overlay uses <strong style={{ color: '#333' }}>per-trace min-max normalization</strong> (display only).
-          Raw magnitudes differ: h_init is ~O(1) after gating while fitted H often scales with W in WH = |STFT|.
+        <div style={{ color: 'var(--ink-body)', fontSize: '10px', marginBottom: '8px', lineHeight: 1.35, textAlign: 'center' }}>
+          Overlay uses <strong style={{ color: 'var(--ink-strong)' }}>per-trace min-max normalization</strong> for display only.
+          The dashed trace is the frame-diff motion prior; H rows are fitted by blind audio NMF.
         </div>
         <ChartSvg xCount={audio.timeFrames}>
           <polyline
             fill="none"
-            stroke={H_INIT_STROKE}
+            stroke={VISUAL_PRIOR_STROKE}
             strokeWidth={STROKE_W}
             strokeDasharray="6 4"
             vectorEffect="non-scaling-stroke"
             points={NmfPlotGeometry.polylinePointsYInRange(
-              hInitForOverlay,
+              visualPriorForOverlay,
               PLOT_W,
               PLOT_H,
               overlayYMin,
@@ -185,13 +197,89 @@ export function AudioNmfFactorizationPlots({ audio }: { audio: AudioNmfFactoriza
           ))}
         </ChartSvg>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', marginTop: '8px', justifyContent: 'center' }}>
-          <span style={{ color: H_INIT_STROKE, fontSize: '11px' }}>h_init row (video upscaled, dashed)</span>
+          <span style={{ color: VISUAL_PRIOR_STROKE, fontSize: '11px' }}>visual prior (motion, dashed)</span>
           {hRows.map((_, j) => (
             <span key={`leg-${j}`} style={{ color: H_STROKES[j % H_STROKES.length], fontSize: '11px' }}>
-              H[{j}, :] fitted
+              H[{j}, :] {j === selectedComponentIndex ? 'selected' : 'fitted'}
             </span>
           ))}
         </div>
+      </div>
+
+      <div>
+        <div style={{ color: 'var(--ink-strong)', fontSize: '12px', marginBottom: '6px' }}>
+          Selected H row vs visual prior
+        </div>
+        <ChartSvg xCount={audio.timeFrames}>
+          <polyline
+            fill="none"
+            stroke={VISUAL_PRIOR_STROKE}
+            strokeWidth={STROKE_W}
+            strokeDasharray="6 4"
+            vectorEffect="non-scaling-stroke"
+            points={NmfPlotGeometry.polylinePointsYInRange(
+              visualPriorForOverlay,
+              PLOT_W,
+              PLOT_H,
+              overlayYMin,
+              overlayYMax,
+            )}
+          />
+          <polyline
+            fill="none"
+            stroke={H_STROKES[selectedComponentIndex % H_STROKES.length]}
+            strokeWidth={STROKE_W + 0.4}
+            vectorEffect="non-scaling-stroke"
+            points={NmfPlotGeometry.polylinePointsYInRange(
+              selectedHForOverlay,
+              PLOT_W,
+              PLOT_H,
+              overlayYMin,
+              overlayYMax,
+            )}
+          />
+        </ChartSvg>
+      </div>
+
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+          gap: '8px',
+          color: 'var(--ink-strong)',
+          fontSize: '11px',
+        }}
+      >
+        {audio.componentScores.map(score => (
+          <div
+            key={score.componentIndex}
+            style={{
+              border: score.componentIndex === selectedComponentIndex ? '2px solid var(--accent)' : '1px solid var(--border-soft)',
+              borderRadius: '6px',
+              padding: '8px',
+              background: score.componentIndex === selectedComponentIndex ? 'var(--accent-soft)' : '#fffdf8',
+            }}
+          >
+            <strong>H[{score.componentIndex}]</strong>
+            <div>score {score.score.toFixed(3)}</div>
+            <div>cos {score.cosine.toFixed(3)} · onset {score.onsetCosine.toFixed(3)}</div>
+            <div>pearson {score.pearson.toFixed(3)}</div>
+            <div>shifted {score.shiftedScore.toFixed(3)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ color: 'var(--ink-body)', fontSize: '11px', textAlign: 'center', lineHeight: 1.55 }}>
+        Original peak {audio.originalPeak.toFixed(3)} · selected component peak {audio.selectedComponentPeak.toFixed(3)}
+        {' '}· residual peak {audio.residualPeak.toFixed(3)}
+        {audio.round2TargetPeak != null && <> · Round 2 target peak {audio.round2TargetPeak.toFixed(3)}</>}
+        {audio.round2RemixPeak != null && <> · Round 2 remix peak {audio.round2RemixPeak.toFixed(3)}</>}
+        {audio.round2Mode && <> · Round 2 mode: {audio.round2Mode === 'grain-demo' ? 'grain demo mode' : 'fixed-W remix'}</>}
+        {selectedComponentIndex !== 0 && (
+          <div style={{ color: 'var(--ink-muted)', marginTop: '4px' }}>
+            Legacy H0 diagnostic: H[0] is displayed above, but it is not assumed to be the target.
+          </div>
+        )}
       </div>
     </div>
   );

@@ -14,10 +14,11 @@ export function NmfPlotsSection({ width, audio }: NmfPlotsSectionProps) {
         marginTop: '14px',
         padding: '14px 16px',
         boxSizing: 'border-box',
-        backgroundColor: '#ffffff',
-        border: '1px solid #d8d8e0',
+        backgroundColor: 'var(--bg-panel)',
+        border: '1px solid var(--border-soft)',
         borderRadius: '8px',
         overflowX: 'hidden',
+        boxShadow: 'var(--shadow-soft)',
       }}
     >
       <AudioNmfFactorizationPlots audio={audio} />

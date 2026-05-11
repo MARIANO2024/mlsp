@@ -17,7 +17,8 @@ export function ProcessingOverlay({ visible, phase }: ProcessingOverlayProps) {
         position: 'fixed',
         inset: 0,
         zIndex: 10000,
-        backgroundColor: 'rgba(8, 8, 12, 0.88)',
+        backgroundColor: 'rgba(245, 241, 232, 0.82)',
+        backdropFilter: 'blur(6px)',
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -29,20 +30,20 @@ export function ProcessingOverlay({ visible, phase }: ProcessingOverlayProps) {
         style={{
           width: '76px',
           height: '76px',
-          border: '5px solid #2a2a3a',
-          borderTopColor: '#a0a0ff',
+          border: '5px solid var(--border-soft)',
+          borderTopColor: 'var(--accent)',
           borderRadius: '50%',
           animation: 'spin 0.85s linear infinite',
         }}
       />
       <div
-        style={{ color: '#d8d8f0', fontSize: '20px', fontWeight: 700, letterSpacing: '0.06em' }}
+        style={{ color: 'var(--ink-strong)', fontSize: '20px', fontWeight: 700, letterSpacing: '0.06em' }}
       >
         {phase?.headline ?? 'Processing…'}
       </div>
       <div
         style={{
-          color: '#777',
+          color: 'var(--ink-body)',
           fontSize: '14px',
           maxWidth: '440px',
           textAlign: 'center',

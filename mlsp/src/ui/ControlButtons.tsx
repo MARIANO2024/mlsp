@@ -36,7 +36,8 @@ export function ControlButtons({
         type="button"
         style={{
           ...BTN_BASE,
-          backgroundColor: showFileList ? '#2e2e50' : '#1a1a2e',
+          backgroundColor: showFileList ? 'var(--accent-soft)' : 'var(--bg-panel)',
+          borderColor: showFileList ? 'var(--accent)' : 'var(--border-soft)',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -61,7 +62,9 @@ export function ControlButtons({
         type="button"
         style={{
           ...BTN_BASE,
-          backgroundColor: isPlaying ? '#7b1a1a' : '#1a1a2e',
+          backgroundColor: isPlaying ? '#ead8d2' : 'var(--accent)',
+          borderColor: isPlaying ? '#d5b7af' : 'var(--accent)',
+          color: isPlaying ? 'var(--danger)' : '#fffdf8',
           opacity: playDisabled ? 0.4 : 1,
           cursor: playDisabled ? 'not-allowed' : 'pointer',
         }}

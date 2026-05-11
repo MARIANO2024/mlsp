@@ -16,21 +16,22 @@ export function MatrixPreviewStrip({ width, frames, matrixShape }: MatrixPreview
         marginTop: '14px',
         padding: '12px',
         boxSizing: 'border-box',
-        backgroundColor: '#11111b',
-        border: '1px solid #252542',
+        backgroundColor: 'var(--bg-panel)',
+        border: '1px solid var(--border-soft)',
         borderRadius: '8px',
+        boxShadow: 'var(--shadow-soft)',
       }}
     >
       <div
         style={{
-          color: '#b7b7d8',
+          color: 'var(--ink-body)',
           fontSize: '12px',
           marginBottom: '10px',
           textAlign: 'center',
         }}
       >
         Matrix preview from reconstructed columns
-        {matrixShape && <span style={{ color: '#777' }}> · X shape: {matrixShape}</span>}
+        {matrixShape && <span style={{ color: 'var(--ink-muted)' }}> · X shape: {matrixShape}</span>}
       </div>
       <div
         style={{
@@ -48,11 +49,11 @@ export function MatrixPreviewStrip({ width, frames, matrixShape }: MatrixPreview
                 width: '100%',
                 imageRendering: 'pixelated',
                 borderRadius: '6px',
-                border: '1px solid #2e2e4e',
-                backgroundColor: '#000',
+                border: '1px solid var(--border-soft)',
+                backgroundColor: '#f0ece3',
               }}
             />
-            <div style={{ marginTop: '6px', color: '#8585a8', fontSize: '11px' }}>
+            <div style={{ marginTop: '6px', color: 'var(--ink-muted)', fontSize: '11px' }}>
               {frame.label}
             </div>
           </div>

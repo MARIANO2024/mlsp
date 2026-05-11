@@ -36,9 +36,11 @@ export function CameraPanel({
           flex: 1,
           minWidth: 0,
           height: '58vh',
-          backgroundColor: '#1a0000',
-          borderRadius: '12px',
+          backgroundColor: 'var(--bg-panel)',
+          borderRadius: '16px',
           overflow: 'hidden',
+          border: '1px solid var(--border-soft)',
+          boxShadow: 'var(--shadow-soft)',
         }}
       >
         <video
@@ -64,8 +66,9 @@ export function CameraPanel({
               alignItems: 'center',
               justifyContent: 'center',
               gap: '12px',
-              color: '#ccc',
+              color: 'var(--ink-body)',
               fontSize: '14px',
+              background: 'rgba(251, 248, 241, 0.88)',
             }}
           >
             {cameraStatus === 'requesting' && (
@@ -73,8 +76,8 @@ export function CameraPanel({
                 style={{
                   width: '36px',
                   height: '36px',
-                  border: '3px solid #555',
-                  borderTop: '3px solid #e55',
+                  border: '3px solid var(--border-soft)',
+                  borderTop: '3px solid var(--accent)',
                   borderRadius: '50%',
                   animation: 'spin 0.8s linear infinite',
                 }}
@@ -96,19 +99,20 @@ export function CameraPanel({
           width: 'clamp(72px, 12vw, 100px)',
           padding: '10px 8px',
           borderRadius: '12px',
-          border: '1px solid #3a3a55',
-          background: 'linear-gradient(180deg, #252542 0%, #1a1a2e 100%)',
-          color: '#b7b7d8',
+          border: '1px solid var(--border-strong)',
+          background: 'linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-surface-2) 100%)',
+          color: 'var(--ink-strong)',
           fontSize: '13px',
           fontWeight: 700,
           letterSpacing: '0.04em',
           cursor: controlsLocked ? 'not-allowed' : 'pointer',
           opacity: controlsLocked ? 0.45 : 1,
+          boxShadow: 'var(--shadow-soft)',
         }}
       >
         Reset
         <br />
-        <span style={{ fontWeight: 500, fontSize: '11px', color: '#777' }}>plots</span>
+        <span style={{ fontWeight: 500, fontSize: '11px', color: 'var(--ink-muted)' }}>plots</span>
       </button>
     </div>
   );

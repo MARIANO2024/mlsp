@@ -12,7 +12,14 @@ export function RecordingStatusRow({ width, recordingStatus, message }: Recordin
       style={{
         width,
         marginTop: '8px',
-        color: recordingStatus === 'recording' ? '#e5a050' : '#777',
+        color:
+          recordingStatus === 'RECORDING'
+            ? 'var(--accent-warm)'
+            : recordingStatus === 'ERROR'
+              ? 'var(--danger)'
+              : recordingStatus === 'COMPLETE'
+                ? 'var(--success)'
+                : 'var(--ink-muted)',
         fontSize: '12px',
         textAlign: 'center',
       }}

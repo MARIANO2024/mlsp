@@ -11,19 +11,20 @@ export function SyncConsole({ width, lines }: SyncConsoleProps) {
         marginTop: '12px',
         padding: '12px 14px',
         boxSizing: 'border-box',
-        backgroundColor: '#08080c',
-        border: '1px solid #252542',
+        backgroundColor: 'var(--bg-panel)',
+        border: '1px solid var(--border-soft)',
         borderRadius: '8px',
-        color: '#b7b7d8',
+        color: 'var(--ink-body)',
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
         fontSize: '11px',
         lineHeight: 1.45,
         maxHeight: '18vh',
         overflowY: 'auto',
         whiteSpace: 'pre-wrap',
+        boxShadow: 'var(--shadow-soft)',
       }}
     >
-      <div style={{ color: '#e5a050', marginBottom: '6px', fontWeight: 700 }}>
+      <div style={{ color: 'var(--accent-warm)', marginBottom: '6px', fontWeight: 700 }}>
         Master Clock Sync Console
       </div>
       {lines.map((line, index) => (
